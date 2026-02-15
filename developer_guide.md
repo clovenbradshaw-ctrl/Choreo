@@ -35,7 +35,7 @@ Every operation uses exactly one of these nine operators, organized in three tri
 | | `SYN` | Synthesis / merging | Merges entity B into entity A. B is killed, its edges are reassigned to A. |
 | **Time** | `ALT` | Alternation / transition | Updates specific fields on an existing entity. |
 | | `SUP` | Superposition / layering | Stores multiple simultaneous values for a field. |
-| | `REC` | Reconfiguration | Schema evolution, snapshot ingest. Triggers bulk operation generation. |
+| | `REC` | Reconfiguration | Snapshot ingest, feedback rules, emergence detection. The system operating on its own output. |
 
 ### Instances
 
@@ -180,7 +180,7 @@ Response:
 
 - Only the fields present in `target` are updated. Other fields are untouched.
 - If the entity doesn't exist, ALT is a no-op (no error, just nothing happens).
-- `frame` is optional metadata about *why* this change happened. It's stored in the log but doesn't affect projection.
+- `frame` is optional metadata about *why* this change happened. It's stored in the log. If frame contains `epistemic`, `source`, or `authority` keys, per-field provenance is recorded on the projected entity (see Frame Provenance).
 
 #### NUL — Destroy an entity or field
 
@@ -296,11 +296,30 @@ As a query (more common):
 }
 ```
 
+**Audit flag:** DES queries are not logged by default. To create an audit trail entry, include `"audit": true` in the frame:
+
+```json
+{
+  "op": "DES",
+  "target": {"query": "state(context.table=\"places\")"},
+  "context": {"type": "query"},
+  "frame": {"audit": true}
+}
+```
+
+The response will include `"audited": true` and `"audit_op_id"` pointing to the logged operation. Use this for intentional queries (reports, investigations) but not for UI interactions (scrubber drags, live filtering).
+
+**Unframed DES warning:** When a DES operation (non-query) has an empty frame, the response includes `"_warning": "unframed_designation"`. This makes frame-hiding visible without blocking the operation.
+
 See the EOQL section below for query syntax.
 
-#### REC — Reconfigure / snapshot ingest
+#### REC — Reconfigure / recursive feedback
 
-The primary use of REC is snapshot ingest — accepting raw state from an external source and decomposing it into granular operations:
+REC means recursion — the moment a derived structure enters the system's feedback loop. REC has three context types: snapshot ingest, feedback rules, and emergence detection.
+
+##### REC: snapshot_ingest
+
+The most common REC use — accepting raw state from an external source and decomposing it into granular operations:
 
 ```json
 {
@@ -371,7 +390,57 @@ Each generated operation has `"generated_by": 47` in its context, creating a tra
 }
 ```
 
-Records a boundary tag on the entity. Mainly used at query time (filtering). The SEG metadata is stored in a `_seg` array on the entity.
+Records a boundary tag on the entity. Queryable via `_seg.boundary` filter (see EOQL section).
+
+##### REC: feedback_rule
+
+A feedback rule watches for operations matching a pattern and generates new operations in response. The system operating on its own output.
+
+```json
+{
+  "op": "REC",
+  "target": {
+    "id": "rule-flag-absent",
+    "trigger": {
+      "op": "DES",
+      "match": {"target.flag": "absent_from_snapshot"}
+    },
+    "action": {
+      "op": "ALT",
+      "target_template": {"id": "{trigger.target.id}", "status": "needs_investigation"},
+      "context": {"table": "{trigger.context.table}"}
+    }
+  },
+  "context": {"type": "feedback_rule"},
+  "frame": {"authority": "michael"}
+}
+```
+
+This says: when a DES operation appears whose target has `flag: "absent_from_snapshot"`, generate an ALT setting `status: "needs_investigation"` on that entity.
+
+- Rules are stored as entities in the `_rules` table via `_projected`
+- Template values like `{trigger.target.id}` are interpolated from the triggering operation
+- **Safeguard:** Rules cannot trigger other rules in the same evaluation pass (prevents infinite loops). One pass per incoming operation.
+- Generated operations carry `generated_by_rule` in their context for traceability
+
+##### REC: emergence_scan
+
+Scans the CON graph for unnamed clusters — structure that exists but nobody has named yet.
+
+```json
+{
+  "op": "REC",
+  "target": {
+    "algorithm": "connected_components",
+    "min_cluster_size": 3,
+    "min_internal_coupling": 0.5
+  },
+  "context": {"type": "emergence_scan"},
+  "frame": {"authority": "system", "confidence": "algorithmic"}
+}
+```
+
+The runtime performs BFS/connected-components on `_con_edges`, finds clusters meeting the size/coupling threshold, and generates DES operations in the `_emergent` table for any clusters not already designated. Each cluster gets a deterministic ID based on its member set.
 
 ### SSE Stream (The One Way Out)
 
@@ -556,6 +625,17 @@ stream(after = "2026-01-01", before = "2026-02-01")
 - `limit` defaults to 100.
 - `after` and `before` filter by timestamp.
 
+### meta() — System table shorthand
+
+```
+meta(types)        → state(context.table="_types")
+meta(rules)        → state(context.table="_rules")
+meta(fields)       → state(context.table="_fields")
+meta(emergent)     → state(context.table="_emergent")
+```
+
+Syntactic sugar for querying the system's own structure.
+
 ### >> CON() — Graph traversal
 
 ```
@@ -665,6 +745,30 @@ Segmentation metadata:
   "_seg": [
     {"boundary": "downtown-district", "op_id": 33}
   ]
+}
+```
+
+Queryable via `_seg.boundary` filter in EOQL.
+
+### Operator history
+
+Tracks which operators have been applied and how many times:
+```json
+{
+  "id": "pl0",
+  "_ops": {"INS": 1, "ALT": 2, "CON": 3}
+}
+```
+
+### Frame provenance
+
+When operations carry epistemic frame data, per-field provenance is recorded:
+```json
+{
+  "id": "pl0",
+  "_provenance": {
+    "capacity": {"op_id": 42, "epistemic": "given", "source": "manual-entry", "authority": "michael"}
+  }
 }
 ```
 
@@ -865,6 +969,204 @@ The only requirement is uniqueness within a `context.table`.
 | 404 | Instance not found |
 
 Choreo is lenient by design. ALT on a nonexistent entity is a no-op, not an error. CON between nonexistent entities still creates the edge. This is intentional — operations are facts about what happened, and the log records them regardless of current projection state.
+
+---
+
+## Choreo 2.0 Features
+
+### Frame Provenance
+
+When operations carry frame metadata with `epistemic`, `source`, or `authority` keys, the projection engine records provenance per field:
+
+```json
+{
+  "id": "pl0",
+  "name": "Listening Room",
+  "capacity": 200,
+  "_provenance": {
+    "name": {"op_id": 1, "epistemic": "given", "source": "manual-entry"},
+    "capacity": {"op_id": 42, "epistemic": "given", "source": "manual-entry", "authority": "michael"}
+  }
+}
+```
+
+Operations with empty frames produce no provenance entries (backward compatible). The `epistemic` value can be a blanket string or a per-field dict.
+
+You can filter by provenance in EOQL:
+```
+state(context.table="places", frame.epistemic="given")
+state(context.table="people", frame.source="court-records")
+```
+
+### Operator History
+
+Every projected entity carries an `_ops` counter tracking which operators have been applied and how many times:
+
+```json
+{
+  "id": "pl0",
+  "name": "Listening Room",
+  "_ops": {"INS": 1, "ALT": 2, "CON": 3, "SEG": 1}
+}
+```
+
+Query by operator history:
+```
+state(context.table="places", _ops.DES=0)     -- never designated
+state(context.table="people", _ops.CON=0)     -- no connections
+```
+
+This makes the developmental cascade (NUL→DES→INS→SEG→CON→SYN→ALT→SUP→REC) queryable.
+
+### SEG Boundary Filtering
+
+Filter entities by their segmentation boundary in EOQL:
+
+```
+state(context.table="places", _seg.boundary="east-nashville")
+```
+
+### Absence Filters
+
+Query by absence type — distinguish *why* something is missing:
+
+| Filter | Meaning |
+|--------|---------|
+| `_has_sup=true` | Entity has at least one field in superposition (contradictory data) |
+| `_has_nul=true` | Entity has at least one explicitly NUL'd field |
+| `_include_dead=true` | Include dead (NUL'd) entities in results (with `_alive: false` marker) |
+| `_only_dead=true` | Show only dead entities |
+
+```
+state(context.table="places", _has_sup=true)
+state(context.table="places", _include_dead=true)
+state(context.table="places", _only_dead=true)
+```
+
+### Replay Profiles (Read-Time Frames)
+
+A replay profile is a frozen configuration of stances applied at query time — the interpretive context of the reading, symmetric with the write-time frame.
+
+**Stances:**
+
+- **Conflict**: `preserve` (show SUPs as-is), `collapse` (pick first variant), `suspend` (mark entity as suspended)
+- **Boundary**: `respect` (honor SEG boundaries), `unified` (ignore all boundaries)
+
+Apply a replay profile via DES query frame:
+
+```json
+{
+  "op": "DES",
+  "target": {"query": "state(context.table=\"places\")"},
+  "context": {"type": "query"},
+  "frame": {
+    "replay": {
+      "conflict": "collapse",
+      "boundary": "unified"
+    }
+  }
+}
+```
+
+**Named profiles** are stored as entities in `_rules` table and referenced by name in convenience endpoints:
+
+```
+GET /{instance}/state/{table}?replay=investigative
+GET /{instance}/state/{table}?replay=publicDashboard
+```
+
+Create a named profile:
+```json
+{
+  "op": "INS",
+  "target": {"id": "profile-investigative", "conflict": "preserve", "boundary": "unified"},
+  "context": {"table": "_rules"}
+}
+```
+
+Because profiles are entities in the log, they can be ALT'd, DES'd, NUL'd, and their history is auditable.
+
+### Self-Reference (Entities Targeting Entities)
+
+The same nine operators work on the system's own structure. Reserved tables by convention:
+
+| Table | Purpose |
+|-------|---------|
+| `_types` | Entity type definitions |
+| `_fields` | Field definitions with policies |
+| `_rules` | Feedback rules and replay profiles |
+| `_emergent` | Algorithmically detected clusters |
+
+Example — define a type:
+```json
+{"op": "INS", "target": {"id": "type-case", "label": "Court Case", "fields": ["filing_date", "case_number"]}, "context": {"table": "_types"}, "frame": {"authority": "michael", "epistemic": "meant"}}
+```
+
+Example — CON between types:
+```json
+{"op": "CON", "target": {"source": "type-case", "target": "type-defendant", "coupling": 0.9, "type": "has_defendant"}, "context": {"table": "_types"}}
+```
+
+EOQL shorthand for system tables:
+```
+meta(types)        → state(context.table="_types")
+meta(rules)        → state(context.table="_rules")
+meta(fields)       → state(context.table="_fields")
+meta(emergent)     → state(context.table="_emergent")
+```
+
+### Bootstrapping Axioms (Fixed Ground)
+
+1. The nine operators exist and have fixed semantics
+2. Operations are ordered by integer ID (temporal sequence)
+3. `_rules` table entities are replayed with LATEST policy (no frame applied)
+4. Feedback rules fire once per incoming operation (no cascading within a pass)
+5. Projection is always rebuildable from the log
+
+Everything else — type definitions, field policies, replay profiles, feedback rules, emergence patterns — is data in the log, operated on by the same nine verbs.
+
+### Biography Endpoint
+
+```
+GET /{instance}/biography/{entity_id}
+```
+
+Returns the full operation history for a single entity across all tables — every INS, ALT, CON, DES, NUL, etc. that ever mentioned this entity, plus its current projected state.
+
+```json
+{
+  "entity_id": "pl0",
+  "operation_count": 5,
+  "operations": [
+    {"id": 1, "ts": "...", "op": "INS", "target": {...}, "context": {...}, "frame": {...}},
+    {"id": 12, "ts": "...", "op": "CON", "target": {"source": "pe0", "target": "pl0", ...}, ...}
+  ],
+  "current_state": {
+    "id": "pl0", "table": "places", "alive": true,
+    "name": "Listening Room", "status": "open", "_ops": {"INS": 1, "ALT": 1, "CON": 2}
+  }
+}
+```
+
+### Gap Analysis Endpoint
+
+```
+GET /{instance}/gaps/{table}
+```
+
+Returns entities grouped by which operators have NOT been applied — operator-typed absence made accessible:
+
+```json
+{
+  "table": "places",
+  "gaps": {
+    "never_designated": ["pl1", "pl2", "pl3"],
+    "never_connected": ["pl4", "pl7"],
+    "has_contradictions": ["pl7"],
+    "never_validated": ["pl0", "pl1", "pl2"]
+  }
+}
+```
 
 ---
 

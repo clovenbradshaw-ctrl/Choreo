@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Choreo Runtime 1.0
+Choreo Runtime 2.0
 EO-native event store with projection engine, EOQL queries, and SSE streaming.
 
 Two endpoints per instance:
@@ -194,7 +194,37 @@ def init_db(instance: str) -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 # Projection Engine
 # ---------------------------------------------------------------------------
-VALID_OPS = {'INS', 'DES', 'SEG', 'CON', 'SYN', 'ALT', 'SUP', 'REC', 'NUL'}
+# The developmental cascade (Update 9)
+OPERATOR_CASCADE = ['NUL', 'DES', 'INS', 'SEG', 'CON', 'SYN', 'ALT', 'SUP', 'REC']
+OPERATOR_TRIADS = {
+    'Identity': ['NUL', 'DES', 'INS'],
+    'Structure': ['SEG', 'CON', 'SYN'],
+    'Time': ['ALT', 'SUP', 'REC'],
+}
+VALID_OPS = set(OPERATOR_CASCADE)
+
+
+def _write_provenance(data: dict, target: dict, frame: dict, op_id: int):
+    """Write frame provenance metadata on projected fields (Update 1a).
+    Only writes provenance when frame contains epistemic/source/authority keys."""
+    if not (frame.get("epistemic") or frame.get("source") or frame.get("authority")):
+        return
+    prov = data.get("_provenance", {})
+    for k in target:
+        if k == "id":
+            continue
+        entry = {"op_id": op_id}
+        if frame.get("epistemic"):
+            if isinstance(frame["epistemic"], dict):
+                entry["epistemic"] = frame["epistemic"].get(k, "unknown")
+            else:
+                entry["epistemic"] = frame["epistemic"]
+        if frame.get("source"):
+            entry["source"] = frame["source"]
+        if frame.get("authority"):
+            entry["authority"] = frame["authority"]
+        prov[k] = entry
+    data["_provenance"] = prov
 
 
 def project_op(db: sqlite3.Connection, op_id: int, op: str,
@@ -220,12 +250,16 @@ def project_op(db: sqlite3.Connection, op_id: int, op: str,
             for k, v in target.items():
                 if k != "id":
                     data[k] = v
+            # Frame provenance (Update 1a)
+            _write_provenance(data, target, frame, op_id)
             db.execute(
                 "UPDATE _projected SET data=?, alive=1, last_op=? WHERE entity_id=? AND tbl=?",
                 (json.dumps(data), op_id, eid, tbl)
             )
         else:
             data = {k: v for k, v in target.items() if k != "id"}
+            # Frame provenance (Update 1a)
+            _write_provenance(data, target, frame, op_id)
             db.execute(
                 "INSERT INTO _projected(entity_id, tbl, data, alive, last_op) VALUES(?,?,?,1,?)",
                 (eid, tbl, json.dumps(data), op_id)
@@ -244,6 +278,8 @@ def project_op(db: sqlite3.Connection, op_id: int, op: str,
             for k, v in target.items():
                 if k not in ("id",):
                     data[k] = v
+            # Frame provenance (Update 1a)
+            _write_provenance(data, target, frame, op_id)
             db.execute(
                 "UPDATE _projected SET data=?, last_op=? WHERE entity_id=? AND tbl=?",
                 (json.dumps(data), op_id, eid, tbl)
@@ -370,10 +406,21 @@ def project_op(db: sqlite3.Connection, op_id: int, op: str,
             )
 
     elif op == "REC":
-        # Reconfiguration — handle snapshot ingest or schema transforms
+        # Reconfiguration — handle snapshot ingest, feedback rules, or emergence scan
         rec_type = context.get("type")
         if rec_type == "snapshot_ingest":
             _handle_snapshot_ingest(db, op_id, target, context, frame)
+        elif rec_type == "feedback_rule":
+            # Store the rule as a projected entity in _rules table (Update 2b)
+            rule_id = target.get("id", f"rule-{op_id}")
+            db.execute(
+                "INSERT OR REPLACE INTO _projected(entity_id, tbl, data, alive, last_op) "
+                "VALUES(?,?,?,1,?)",
+                (rule_id, "_rules", json.dumps(target), op_id)
+            )
+        elif rec_type == "emergence_scan":
+            # Find unnamed clusters in the CON graph (Update 2c)
+            _handle_emergence_scan(db, op_id, target, context, frame)
 
     elif op == "SEG":
         # Segmentation: no projection effect by default
@@ -395,6 +442,29 @@ def project_op(db: sqlite3.Connection, op_id: int, op: str,
                         "UPDATE _projected SET data=?, last_op=? WHERE entity_id=? AND tbl=?",
                         (json.dumps(data), op_id, eid, tbl)
                     )
+
+    # Track operator history on the entity (_ops counter)
+    _eid = eid
+    if not _eid and op == "CON":
+        _eid = None  # CON edges don't have a single entity
+    elif not _eid and op == "SYN":
+        _eid = target.get("merge_into") or target.get("primary")
+    elif not _eid and op == "NUL":
+        _eid = target.get("entity_id")
+    if _eid:
+        _ops_row = db.execute(
+            "SELECT data FROM _projected WHERE entity_id=? AND tbl=?",
+            (_eid, tbl)
+        ).fetchone()
+        if _ops_row:
+            _ops_data = json.loads(_ops_row["data"])
+            ops_history = _ops_data.get("_ops", {})
+            ops_history[op] = ops_history.get(op, 0) + 1
+            _ops_data["_ops"] = ops_history
+            db.execute(
+                "UPDATE _projected SET data=? WHERE entity_id=? AND tbl=?",
+                (json.dumps(_ops_data), _eid, tbl)
+            )
 
     # Update watermark
     db.execute(
@@ -590,6 +660,167 @@ def _handle_snapshot_ingest(db, rec_op_id, target, context, frame):
 
 
 # ---------------------------------------------------------------------------
+# Feedback Rule Evaluation (Update 2b)
+# ---------------------------------------------------------------------------
+def _trigger_matches(match: dict, target: dict, context: dict, frame: dict) -> bool:
+    """Check if an operation matches a rule's trigger conditions."""
+    for key, expected in match.items():
+        # Support dotted paths like "target.flag"
+        parts = key.split(".", 1)
+        if len(parts) == 2:
+            scope, field = parts
+            source = {"target": target, "context": context, "frame": frame}.get(scope, {})
+            if source.get(field) != expected:
+                return False
+        else:
+            if target.get(key) != expected:
+                return False
+    return True
+
+
+def _interpolate_template(template: dict, data: dict) -> dict:
+    """Replace {trigger.target.id} style placeholders in a template dict."""
+    result = {}
+    for k, v in template.items():
+        if isinstance(v, str) and "{" in v:
+            # Replace placeholders
+            def replacer(m):
+                path = m.group(1).split(".")
+                obj = data
+                for p in path:
+                    if isinstance(obj, dict):
+                        obj = obj.get(p, "")
+                    else:
+                        return m.group(0)
+                return str(obj) if not isinstance(obj, str) else obj
+            v = re.sub(r'\{([^}]+)\}', replacer, v)
+        elif isinstance(v, dict):
+            v = _interpolate_template(v, data)
+        result[k] = v
+    return result
+
+
+def _evaluate_rules(db, op_id: int, op: str, target: dict, context: dict, frame: dict):
+    """Check if any feedback rules trigger on this operation (Update 2b).
+    Rules cannot trigger other rules in the same evaluation pass (prevents infinite loops)."""
+    # Don't evaluate rules for rule-generated operations
+    if context.get("generated_by_rule"):
+        return
+
+    rules = db.execute(
+        "SELECT entity_id, data FROM _projected WHERE tbl='_rules' AND alive=1"
+    ).fetchall()
+
+    for rule_row in rules:
+        rule = json.loads(rule_row["data"])
+        trigger = rule.get("trigger")
+        if not trigger:
+            continue  # Not a feedback rule (could be a replay profile)
+
+        # Check if this operation matches the trigger
+        if trigger.get("op") and trigger["op"] != op:
+            continue
+        match = trigger.get("match", {})
+        if not _trigger_matches(match, target, context, frame):
+            continue
+
+        # Generate the action operation
+        action = rule.get("action", {})
+        if not action.get("op"):
+            continue
+
+        interp_data = {"trigger": {"target": target, "context": context, "frame": frame}}
+        generated_target = _interpolate_template(
+            action.get("target_template", {}), interp_data
+        )
+        generated_context = _interpolate_template(
+            action.get("context", {}), interp_data
+        )
+        generated_context["generated_by_rule"] = rule_row["entity_id"]
+
+        # Append and project the generated operation
+        cursor = db.execute(
+            "INSERT INTO operations(op, target, context, frame) VALUES(?,?,?,?)",
+            (action["op"], json.dumps(generated_target),
+             json.dumps(generated_context), json.dumps({}))
+        )
+        project_op(db, cursor.lastrowid, action["op"],
+                   generated_target, generated_context, {})
+
+
+# ---------------------------------------------------------------------------
+# Emergence Scan (Update 2c)
+# ---------------------------------------------------------------------------
+def _handle_emergence_scan(db, op_id: int, target: dict, context: dict, frame: dict):
+    """Scan the CON graph for unnamed clusters and designate them."""
+    min_cluster_size = target.get("min_cluster_size", 3)
+    min_coupling = target.get("min_internal_coupling", 0.0)
+
+    # Build adjacency list from live CON edges
+    edges = db.execute(
+        "SELECT source_id, target_id, coupling FROM _con_edges WHERE alive=1 AND coupling>=?",
+        (min_coupling,)
+    ).fetchall()
+
+    adjacency = {}
+    for edge in edges:
+        src, tgt = edge["source_id"], edge["target_id"]
+        adjacency.setdefault(src, set()).add(tgt)
+        adjacency.setdefault(tgt, set()).add(src)
+
+    # BFS connected components
+    visited = set()
+    clusters = []
+    for node in adjacency:
+        if node in visited:
+            continue
+        component = set()
+        queue = [node]
+        while queue:
+            current = queue.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            component.add(current)
+            for neighbor in adjacency.get(current, set()):
+                if neighbor not in visited:
+                    queue.append(neighbor)
+        if len(component) >= min_cluster_size:
+            clusters.append(component)
+
+    generated_ops = []
+    for cluster in clusters:
+        # Check if this cluster is already designated in _emergent
+        cluster_id = f"cluster-{hashlib.md5(str(sorted(cluster)).encode()).hexdigest()[:8]}"
+        existing = db.execute(
+            "SELECT entity_id FROM _projected WHERE entity_id=? AND tbl='_emergent' AND alive=1",
+            (cluster_id,)
+        ).fetchone()
+        if existing:
+            continue
+
+        # DES the cluster as an emergent entity
+        des_target = {
+            "id": cluster_id,
+            "flag": "emergent_cluster",
+            "members": sorted(list(cluster)),
+            "member_count": len(cluster)
+        }
+        des_context = {
+            "table": "_emergent",
+            "generated_by": op_id
+        }
+        cursor = db.execute(
+            "INSERT INTO operations(op, target, context, frame) VALUES(?,?,?,?)",
+            ("DES", json.dumps(des_target), json.dumps(des_context), json.dumps(frame))
+        )
+        project_op(db, cursor.lastrowid, "DES", des_target, des_context, frame)
+        generated_ops.append({"op": "DES", "target": des_target})
+
+    return generated_ops
+
+
+# ---------------------------------------------------------------------------
 # EOQL Parser
 # ---------------------------------------------------------------------------
 # Grammar:
@@ -602,6 +833,12 @@ def _handle_snapshot_ingest(db, rec_op_id, target, context, frame):
 def parse_eoql(query_str: str) -> dict:
     """Parse an EOQL query string into a structured query dict."""
     query_str = query_str.strip()
+
+    # meta() shorthand (Update 7c)
+    meta_match = re.match(r'^meta\((\w+)\)$', query_str)
+    if meta_match:
+        meta_table = f"_{meta_match.group(1)}"
+        return {"type": "state", "filters": {"context.table": meta_table}}
 
     # Check for CON chaining: state(...) >> CON(...)
     chain_match = re.match(r'^(state\([^)]*\))\s*>>\s*CON\(([^)]*)\)$', query_str)
@@ -678,32 +915,83 @@ def execute_eoql(db: sqlite3.Connection, query: dict) -> dict:
     return {"error": "Unknown query type"}
 
 
+def _apply_replay_profile(results: list, frame: dict, filters: dict):
+    """Apply replay profile stances to query results (Update 5)."""
+    if not frame:
+        return
+    replay = frame.get("replay", {})
+    if not replay:
+        return
+
+    # Conflict stance (Update 5b)
+    conflict_stance = replay.get("conflict", "preserve")
+    if conflict_stance == "collapse":
+        for entity in results:
+            for k, v in list(entity.items()):
+                if isinstance(v, dict) and "_sup" in v:
+                    variants = v["_sup"]
+                    entity[k] = variants[0]["value"] if variants else None
+                    entity.setdefault("_collapsed", []).append(k)
+    elif conflict_stance == "suspend":
+        for entity in results:
+            for k, v in entity.items():
+                if isinstance(v, dict) and "_sup" in v:
+                    entity["_suspended"] = True
+                    break
+
+    # Boundary stance (Update 5c)
+    boundary_stance = replay.get("boundary", "respect")
+    if boundary_stance == "unified":
+        # Remove any _seg.boundary filter — already handled by filters dict
+        pass  # Filtering already happened; unified means we don't re-filter
+
+
 def _exec_state(db: sqlite3.Connection, query: dict) -> dict:
     """Execute a state() query against the projection (or replay for time-travel)."""
     filters = query.get("filters", {})
     at = query.get("at")
+    frame = query.get("frame", {})
     tbl = filters.get("context.table", "_default")
 
     if at:
         # Time-travel: find nearest snapshot, replay forward
         return _exec_state_at(db, tbl, filters, at)
 
-    # Current state: read from projection
-    rows = db.execute(
-        "SELECT entity_id, data FROM _projected WHERE tbl=? AND alive=1",
-        (tbl,)
-    ).fetchall()
+    # Current state: read from projection (Update 4c/4d: dead entity filters)
+    if filters.get("_only_dead"):
+        rows = db.execute(
+            "SELECT entity_id, data, alive FROM _projected WHERE tbl=? AND alive=0",
+            (tbl,)
+        ).fetchall()
+    elif filters.get("_include_dead"):
+        rows = db.execute(
+            "SELECT entity_id, data, alive FROM _projected WHERE tbl=?",
+            (tbl,)
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT entity_id, data FROM _projected WHERE tbl=? AND alive=1",
+            (tbl,)
+        ).fetchall()
 
     results = []
     for row in rows:
         data = json.loads(row["data"])
         entity = {"id": row["entity_id"], **data}
+        # Mark dead entities when included
+        if filters.get("_include_dead") or filters.get("_only_dead"):
+            entity["_alive"] = bool(row["alive"])
 
         # Apply target.* filters
         if _matches_filters(entity, filters):
             results.append(entity)
 
     result = {"type": "state", "table": tbl, "count": len(results), "entities": results}
+
+    # Apply replay profile post-processing (Update 5)
+    _apply_replay_profile(results, frame, filters)
+
+    result["count"] = len(results)
 
     # Handle CON chaining
     if "chain" in query:
@@ -866,6 +1154,53 @@ def _matches_filters(entity: dict, filters: dict) -> bool:
     for key, val in filters.items():
         if key.startswith("context."):
             continue  # Already handled by table selection
+        # Meta filters — skip these (handled elsewhere)
+        if key in ("_include_dead", "_only_dead"):
+            continue
+
+        # SEG boundary filter (Update 3)
+        if key == "_seg.boundary":
+            segs = entity.get("_seg", [])
+            if not any(s.get("boundary") == val for s in segs):
+                return False
+            continue
+
+        # Absence filters (Update 4)
+        if key == "_has_sup":
+            has_sup = any(
+                isinstance(v, dict) and "_sup" in v
+                for k, v in entity.items() if not k.startswith("_")
+            )
+            if has_sup != bool(val):
+                return False
+            continue
+
+        if key == "_has_nul":
+            has_nul = any(
+                isinstance(v, dict) and "_nul" in v
+                for k, v in entity.items() if not k.startswith("_")
+            )
+            if has_nul != bool(val):
+                return False
+            continue
+
+        # Frame provenance filters (Update 1c)
+        if key.startswith("frame."):
+            frame_field = key.replace("frame.", "")
+            prov = entity.get("_provenance", {})
+            if not any(p.get(frame_field) == val for p in prov.values()):
+                return False
+            continue
+
+        # Operator history filters (Update 6)
+        if key.startswith("_ops."):
+            op_name = key.replace("_ops.", "")
+            op_count = entity.get("_ops", {}).get(op_name, 0)
+            if isinstance(val, int):
+                if op_count != val:
+                    return False
+            continue
+
         field = key.replace("target.", "")
         entity_val = entity.get(field)
         # Handle SUP'd fields: match against any variant
@@ -1017,17 +1352,26 @@ def post_operation(instance):
         query_str = target["query"]
         parsed = parse_eoql(query_str)
 
-        # Optionally append to log for audit
+        # Optionally append to log for audit (Update 8)
         audit = frame.get("audit", False)
+        audit_op_id = None
         if audit:
             cursor = db.execute(
                 "INSERT INTO operations(op, target, context, frame) VALUES(?,?,?,?)",
                 (op, json.dumps(target), json.dumps(context), json.dumps(frame))
             )
+            audit_op_id = cursor.lastrowid
             project_op(db, cursor.lastrowid, op, target, context, frame)
             db.commit()
 
+        # Pass frame to _exec_state for replay profile support (Update 5)
+        if parsed.get("type") == "state":
+            parsed["frame"] = frame
+
         result = execute_eoql(db, parsed)
+        result["audited"] = audit
+        if audit and audit_op_id:
+            result["audit_op_id"] = audit_op_id
         return jsonify(result)
 
     # --- Normal operation ---
@@ -1039,6 +1383,10 @@ def post_operation(instance):
 
     # Project synchronously
     project_op(db, op_id, op, target, context, frame)
+
+    # Evaluate feedback rules (Update 2b)
+    _evaluate_rules(db, op_id, op, target, context, frame)
+
     maybe_snapshot(db, op_id)
     db.commit()
 
@@ -1064,6 +1412,10 @@ def post_operation(instance):
     # Return the appended operation
     ts = db.execute("SELECT ts FROM operations WHERE id=?", (op_id,)).fetchone()["ts"]
     result = {"op_id": op_id, "ts": ts, "op": op}
+
+    # DES unframed warning (Update 1b)
+    if op == "DES" and not frame:
+        result["_warning"] = "unframed_designation"
 
     # Fire outbound webhooks (non-blocking)
     fire_webhooks(instance, {
@@ -1170,6 +1522,7 @@ def get_state(instance, tbl):
     """
     Convenience GET for state queries. Equivalent to:
     POST /{instance}/operations { op: "DES", target: { query: "state(context.table=tbl)" } }
+    Supports ?replay=profileName for named replay profiles (Update 5d).
     """
     db = get_db(instance)
     if db is None:
@@ -1178,6 +1531,18 @@ def get_state(instance, tbl):
     at = request.args.get("at")
     if at:
         query["at"] = at
+
+    # Named replay profile support (Update 5d)
+    replay_name = request.args.get("replay")
+    if replay_name:
+        profile_row = db.execute(
+            "SELECT data FROM _projected WHERE entity_id=? AND tbl='_rules' AND alive=1",
+            (f"profile-{replay_name}",)
+        ).fetchone()
+        if profile_row:
+            profile_data = json.loads(profile_row["data"])
+            query["frame"] = {"replay": profile_data}
+
     return jsonify(execute_eoql(db, query))
 
 
@@ -1248,11 +1613,35 @@ DEMO_SEED = {
         {"ts": "2025-03-10T10:00:00Z", "op": "CON", "target": {"source": "ev0", "target": "pl0", "coupling": 0.8, "type": "hosted_at"}, "context": {"table": "cross"}, "frame": {}},
         {"ts": "2025-03-10T10:01:00Z", "op": "CON", "target": {"source": "ev1", "target": "pl5", "coupling": 0.7, "type": "hosted_at"}, "context": {"table": "cross"}, "frame": {}},
 
-        # --- SUP: contradictory data ---
+        # --- SUP: contradictory data (Time triad — layering) ---
         {"ts": "2025-04-15T10:00:00Z", "op": "SUP", "target": {"id": "pl7", "field": "capacity", "variants": [{"source": "permit", "value": 120}, {"source": "website", "value": 85}]}, "context": {"table": "places"}, "frame": {}},
 
-        # --- DES: designation ---
-        {"ts": "2025-05-01T10:00:00Z", "op": "DES", "target": {"id": "pe4", "title": "Community Lead", "appointed_by": "neighborhood_council"}, "context": {"table": "people"}, "frame": {}},
+        # --- DES: designation (Identity triad — naming) ---
+        {"ts": "2025-05-01T10:00:00Z", "op": "DES", "target": {"id": "pe4", "title": "Community Lead", "appointed_by": "neighborhood_council"}, "context": {"table": "people"}, "frame": {"epistemic": "given", "authority": "neighborhood_council"}},
+
+        # --- SEG: boundary (Structure triad — filtering) ---
+        {"ts": "2025-05-05T10:00:00Z", "op": "SEG", "target": {"id": "pl0", "boundary": "east-nashville"}, "context": {"table": "places"}, "frame": {}},
+        {"ts": "2025-05-05T10:01:00Z", "op": "SEG", "target": {"id": "pl1", "boundary": "east-nashville"}, "context": {"table": "places"}, "frame": {}},
+        {"ts": "2025-05-05T10:02:00Z", "op": "SEG", "target": {"id": "pl3", "boundary": "east-nashville"}, "context": {"table": "places"}, "frame": {}},
+        {"ts": "2025-05-05T10:03:00Z", "op": "SEG", "target": {"id": "pl6", "boundary": "east-nashville"}, "context": {"table": "places"}, "frame": {}},
+
+        # --- Frame provenance example: INS with epistemic frame ---
+        {"ts": "2025-05-10T10:00:00Z", "op": "ALT", "target": {"id": "pl0", "capacity": 200}, "context": {"table": "places"}, "frame": {"epistemic": "given", "source": "manual-entry", "authority": "michael"}},
+
+        # --- Self-referential: type definitions (Update 7) ---
+        {"ts": "2025-05-15T10:00:00Z", "op": "INS", "target": {"id": "type-place", "label": "Place", "fields": ["name", "type", "status", "capacity"]}, "context": {"table": "_types"}, "frame": {"authority": "michael", "epistemic": "meant"}},
+        {"ts": "2025-05-15T10:01:00Z", "op": "INS", "target": {"id": "type-person", "label": "Person", "fields": ["name", "role"]}, "context": {"table": "_types"}, "frame": {"authority": "michael", "epistemic": "meant"}},
+        {"ts": "2025-05-15T10:02:00Z", "op": "INS", "target": {"id": "type-event", "label": "Event", "fields": ["name", "type", "date"]}, "context": {"table": "_types"}, "frame": {"authority": "michael", "epistemic": "meant"}},
+        # CON between types
+        {"ts": "2025-05-15T10:03:00Z", "op": "CON", "target": {"source": "type-person", "target": "type-place", "coupling": 0.7, "type": "frequents"}, "context": {"table": "_types"}, "frame": {"authority": "michael"}},
+        {"ts": "2025-05-15T10:04:00Z", "op": "CON", "target": {"source": "type-event", "target": "type-place", "coupling": 0.8, "type": "hosted_at"}, "context": {"table": "_types"}, "frame": {"authority": "michael"}},
+
+        # --- Named replay profile (Update 5d) ---
+        {"ts": "2025-05-20T10:00:00Z", "op": "INS", "target": {"id": "profile-investigative", "conflict": "preserve", "boundary": "unified", "temporal": "asOf"}, "context": {"table": "_rules"}, "frame": {"authority": "michael"}},
+        {"ts": "2025-05-20T10:01:00Z", "op": "INS", "target": {"id": "profile-publicDashboard", "conflict": "collapse", "boundary": "respect", "temporal": "asOf"}, "context": {"table": "_rules"}, "frame": {"authority": "michael"}},
+
+        # --- Feedback rule example (Update 2b) ---
+        {"ts": "2025-05-25T10:00:00Z", "op": "REC", "target": {"id": "rule-flag-absent", "trigger": {"op": "DES", "match": {"target.flag": "absent_from_snapshot"}}, "action": {"op": "ALT", "target_template": {"id": "{trigger.target.id}", "status": "needs_investigation"}, "context": {"table": "{trigger.context.table}", "generated_by": "rule-flag-absent"}}}, "context": {"type": "feedback_rule"}, "frame": {"authority": "michael"}},
     ]
 }
 
@@ -1302,6 +1691,97 @@ def ui():
     return Response(_UI_HTML, mimetype="text/html")
 
 # ---------------------------------------------------------------------------
+# Convenience: Entity Biography (Update 10a)
+# ---------------------------------------------------------------------------
+@app.route("/<instance>/biography/<eid>", methods=["GET"])
+def get_biography(instance, eid):
+    """Full operation history for a single entity across all tables."""
+    db = get_db(instance)
+    if db is None:
+        return jsonify({"error": "Not found"}), 404
+
+    # All operations that mention this entity
+    ops = db.execute(
+        "SELECT id, ts, op, target, context, frame FROM operations "
+        "WHERE json_extract(target, '$.id')=? "
+        "OR json_extract(target, '$.source')=? "
+        "OR json_extract(target, '$.target')=? "
+        "OR json_extract(target, '$.merge_into')=? "
+        "OR json_extract(target, '$.merge_from')=? "
+        "OR json_extract(target, '$.entity_id')=? "
+        "ORDER BY id",
+        (eid, eid, eid, eid, eid, eid)
+    ).fetchall()
+
+    history = [{
+        "id": r["id"], "ts": r["ts"], "op": r["op"],
+        "target": json.loads(r["target"]),
+        "context": json.loads(r["context"]),
+        "frame": json.loads(r["frame"])
+    } for r in ops]
+
+    # Current projected state
+    current = db.execute(
+        "SELECT entity_id, tbl, data, alive FROM _projected WHERE entity_id=?",
+        (eid,)
+    ).fetchone()
+
+    state = None
+    if current:
+        state = {
+            "id": eid, "table": current["tbl"],
+            "alive": bool(current["alive"]),
+            **json.loads(current["data"])
+        }
+
+    return jsonify({
+        "entity_id": eid,
+        "operation_count": len(history),
+        "operations": history,
+        "current_state": state
+    })
+
+
+# ---------------------------------------------------------------------------
+# Convenience: Gap Analysis (Update 10b)
+# ---------------------------------------------------------------------------
+@app.route("/<instance>/gaps/<tbl>", methods=["GET"])
+def get_gaps(instance, tbl):
+    """Entities grouped by which operators have NOT been applied."""
+    db = get_db(instance)
+    if db is None:
+        return jsonify({"error": "Not found"}), 404
+
+    rows = db.execute(
+        "SELECT entity_id, data FROM _projected WHERE tbl=? AND alive=1",
+        (tbl,)
+    ).fetchall()
+
+    gaps = {
+        "never_designated": [],
+        "never_connected": [],
+        "has_contradictions": [],
+        "never_validated": [],
+    }
+
+    for row in rows:
+        data = json.loads(row["data"])
+        ops = data.get("_ops", {})
+        eid = row["entity_id"]
+
+        if "DES" not in ops:
+            gaps["never_designated"].append(eid)
+        if "CON" not in ops:
+            gaps["never_connected"].append(eid)
+        if any(isinstance(v, dict) and "_sup" in v for v in data.values()):
+            gaps["has_contradictions"].append(eid)
+        if "REC" not in ops:
+            gaps["never_validated"].append(eid)
+
+    return jsonify({"table": tbl, "gaps": gaps})
+
+
+# ---------------------------------------------------------------------------
 # Health / Info
 # ---------------------------------------------------------------------------
 @app.route("/", methods=["GET"])
@@ -1309,8 +1789,11 @@ def index():
     return jsonify({
         "name": "Choreo Runtime",
         "ui": "/ui",
-        "version": "1.0",
-        "operators": sorted(VALID_OPS),
+        "version": "2.0",
+        "operators": {
+            "cascade": OPERATOR_CASCADE,
+            "triads": OPERATOR_TRIADS,
+        },
         "endpoints": {
             "POST /{instance}/operations": "The one way in",
             "GET /{instance}/stream": "The one way out (SSE)",
@@ -1321,6 +1804,8 @@ def index():
             "POST /demo/seed": "Seed demo data",
             "GET /{instance}/state/{table}": "Convenience state query",
             "GET /{instance}/state/{table}/{id}": "Convenience entity lookup",
+            "GET /{instance}/biography/{entity_id}": "Full entity operation history",
+            "GET /{instance}/gaps/{table}": "Gap analysis by operator absence",
         }
     })
 
@@ -1400,7 +1885,7 @@ server {{
 
     print(f"""
 ╔═══════════════════════════════════════╗
-║          Choreo Runtime 1.0            ║
+║          Choreo Runtime 2.0            ║
 ║  EO-native event store                ║
 ╠═══════════════════════════════════════╣
 ║  POST /:instance/operations  — in     ║
