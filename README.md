@@ -11,7 +11,7 @@ GET  /{instance}/stream      — the one way out (SSE)
 
 ```bash
 pip install flask
-python3 choreo.py --port 8420
+python3 choreo_runtime.py --port 8420
 # → http://localhost:8420/ui
 ```
 
@@ -31,12 +31,12 @@ Every mutation is one of these nine. Every query is a DES. Schema is data. The l
 
 | Doc | What it covers |
 |-----|---------------|
-| [docs/OPERATORS.md](docs/OPERATORS.md) | Complete operator reference |
-| [docs/DESIGN.md](docs/DESIGN.md) | Why Choreo works the way it does |
-| [docs/EOQL.md](docs/EOQL.md) | Query language reference |
-| [docs/THEORY.md](docs/THEORY.md) | Theoretical foundations (v2) |
-| [docs/FRACTAL.md](docs/FRACTAL.md) | Self-similar structure of the framework |
-| [docs/EVENT_TYPES.md](docs/EVENT_TYPES.md) | Nine operators replace 200+ event types |
+| [OPERATORS.md](OPERATORS.md) | Complete operator reference |
+| [DESIGN.md](DESIGN.md) | Why Choreo works the way it does |
+| [EOQL.md](EOQL.md) | Query language reference |
+| [THEORY.md](THEORY.md) | Theoretical foundations (v2) |
+| [FRACTAL.md](FRACTAL.md) | Self-similar structure of the framework |
+| [EVENT_TYPES.md](EVENT_TYPES.md) | Nine operators replace 200+ event types |
 | [developer_guide.md](developer_guide.md) | API reference and integration patterns |
 
 ## Key Concepts
@@ -52,6 +52,6 @@ Every mutation is one of these nine. Every query is a DES. Schema is data. The l
 ## Production
 
 ```bash
-python3 choreo.py --nginx choreo.yourdomain.com  # generates nginx config
-pm2 start choreo.py --interpreter python3 -- --port 8420
+python3 choreo_runtime.py --nginx choreo.yourdomain.com  # generates nginx config
+pm2 start choreo_runtime.py --interpreter python3 -- --port 8420
 ```
