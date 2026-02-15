@@ -19,11 +19,11 @@ Both `stance` and `exclude` can be combined with `min_coupling` for hybrid queri
 
 **Emergence scan:** Accepts `min_stance` parameter to filter cluster detection by edge stance.
 
-**Migration:** Existing instances need `POST /instances/{slug}/rebuild` or DB recreation to get the new schema. Apply via `python3 choreo_stance_patch.py choreo.py`.
+**Migration:** Existing instances need `POST /instances/{slug}/rebuild` or DB recreation to get the new schema. Stance support is now integrated into the main runtime — the separate `choreo_stance_patch.py` is no longer needed for new deployments.
 
 ### Documentation
 
-New and updated docs in `docs/`:
+New and updated docs:
 
 | File | What it covers |
 |------|---------------|

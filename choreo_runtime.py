@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Choreo Runtime 2.0
-EO-native event store with projection engine, EOQL queries, and SSE streaming.
+Choreo Runtime 2.1
+EO-native event store with projection engine, EOQL queries, CON stance, and SSE streaming.
 
 Two endpoints per instance:
   POST /{instance}/operations  — the one way in
@@ -13,7 +13,7 @@ Plus instance management:
   DELETE /instances/{slug}
   POST   /instances/{slug}/seed
 
-Run: python choreo.py [--port 8420] [--dir ./instances]
+Run: python choreo_runtime.py [--port 8420] [--dir ./instances]
 """
 
 import sqlite3, json, os, re, time, sys, threading, hashlib
@@ -152,6 +152,7 @@ def init_db(instance: str) -> sqlite3.Connection:
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
             source_id TEXT NOT NULL,
             target_id TEXT NOT NULL,
+            stance    TEXT DEFAULT 'accidental' CHECK(stance IN('accidental','essential','generative')),
             coupling  REAL DEFAULT 0,
             data      TEXT DEFAULT '{}',
             op_id     INTEGER NOT NULL,
@@ -340,13 +341,23 @@ def project_op(db: sqlite3.Connection, op_id: int, op: str,
         src = target.get("source") or target.get("from")
         tgt = target.get("target") or target.get("to")
         coupling = target.get("coupling", 0.5)
+        # Stance: dialectical position (accidental/essential/generative)
+        # Infer from coupling if stance not explicit (backward compat)
+        stance = target.get("stance", None)
+        if stance is None:
+            if coupling >= 0.7:
+                stance = "essential"
+            elif coupling >= 0.55:
+                stance = "generative"
+            else:
+                stance = "accidental"
         con_data = {k: v for k, v in target.items()
-                    if k not in ("source", "target", "from", "to", "coupling", "id")}
+                    if k not in ("source", "target", "from", "to", "coupling", "stance", "id")}
         if src and tgt:
             db.execute(
-                "INSERT INTO _con_edges(source_id, target_id, coupling, data, op_id, alive) "
-                "VALUES(?,?,?,?,?,1)",
-                (src, tgt, coupling, json.dumps(con_data), op_id)
+                "INSERT INTO _con_edges(source_id, target_id, stance, coupling, data, op_id, alive) "
+                "VALUES(?,?,?,?,?,?,1)",
+                (src, tgt, stance, coupling, json.dumps(con_data), op_id)
             )
 
     elif op == "SYN":
@@ -444,27 +455,47 @@ def project_op(db: sqlite3.Connection, op_id: int, op: str,
                     )
 
     # Track operator history on the entity (_ops counter)
-    _eid = eid
-    if not _eid and op == "CON":
-        _eid = None  # CON edges don't have a single entity
-    elif not _eid and op == "SYN":
-        _eid = target.get("merge_into") or target.get("primary")
-    elif not _eid and op == "NUL":
-        _eid = target.get("entity_id")
-    if _eid:
-        _ops_row = db.execute(
-            "SELECT data FROM _projected WHERE entity_id=? AND tbl=?",
-            (_eid, tbl)
-        ).fetchone()
-        if _ops_row:
-            _ops_data = json.loads(_ops_row["data"])
-            ops_history = _ops_data.get("_ops", {})
-            ops_history[op] = ops_history.get(op, 0) + 1
-            _ops_data["_ops"] = ops_history
-            db.execute(
-                "UPDATE _projected SET data=? WHERE entity_id=? AND tbl=?",
-                (json.dumps(_ops_data), _eid, tbl)
-            )
+    # CON tracks on both source and target entities across all tables
+    if op == "CON":
+        con_src = target.get("source") or target.get("from")
+        con_tgt = target.get("target") or target.get("to")
+        for _cid in (con_src, con_tgt):
+            if not _cid:
+                continue
+            # CON edges can cross tables, so find the entity wherever it lives
+            _ops_row = db.execute(
+                "SELECT entity_id, tbl, data FROM _projected WHERE entity_id=? AND alive=1",
+                (_cid,)
+            ).fetchone()
+            if _ops_row:
+                _ops_data = json.loads(_ops_row["data"])
+                ops_history = _ops_data.get("_ops", {})
+                ops_history["CON"] = ops_history.get("CON", 0) + 1
+                _ops_data["_ops"] = ops_history
+                db.execute(
+                    "UPDATE _projected SET data=? WHERE entity_id=? AND tbl=?",
+                    (json.dumps(_ops_data), _cid, _ops_row["tbl"])
+                )
+    else:
+        _eid = eid
+        if not _eid and op == "SYN":
+            _eid = target.get("merge_into") or target.get("primary")
+        elif not _eid and op == "NUL":
+            _eid = target.get("entity_id")
+        if _eid:
+            _ops_row = db.execute(
+                "SELECT data FROM _projected WHERE entity_id=? AND tbl=?",
+                (_eid, tbl)
+            ).fetchone()
+            if _ops_row:
+                _ops_data = json.loads(_ops_row["data"])
+                ops_history = _ops_data.get("_ops", {})
+                ops_history[op] = ops_history.get(op, 0) + 1
+                _ops_data["_ops"] = ops_history
+                db.execute(
+                    "UPDATE _projected SET data=? WHERE entity_id=? AND tbl=?",
+                    (json.dumps(_ops_data), _eid, tbl)
+                )
 
     # Update watermark
     db.execute(
@@ -757,9 +788,17 @@ def _handle_emergence_scan(db, op_id: int, target: dict, context: dict, frame: d
     min_coupling = target.get("min_internal_coupling", 0.0)
 
     # Build adjacency list from live CON edges
+    min_stance = target.get("min_stance", None)  # accidental, essential, or generative
+    stance_sql = ""
+    params = [min_coupling]
+    if min_stance:
+        if min_stance == "essential":
+            stance_sql = " AND stance IN('essential','generative')"
+        elif min_stance == "generative":
+            stance_sql = " AND stance='generative'"
     edges = db.execute(
-        "SELECT source_id, target_id, coupling FROM _con_edges WHERE alive=1 AND coupling>=?",
-        (min_coupling,)
+        f"SELECT source_id, target_id, coupling FROM _con_edges WHERE alive=1 AND coupling>=?{stance_sql}",
+        params
     ).fetchall()
 
     adjacency = {}
@@ -848,8 +887,12 @@ def parse_eoql(query_str: str) -> dict:
         base["chain"] = {
             "type": "CON",
             "hops": int(con_params.get("hops", 1)),
-            "min_coupling": float(con_params.get("min_coupling", 0))
+            "min_coupling": float(con_params.get("min_coupling", 0)),
         }
+        if "stance" in con_params:
+            base["chain"]["stance"] = con_params["stance"]
+        if "exclude" in con_params:
+            base["chain"]["exclude"] = con_params["exclude"]
         return base
 
     # state(...)
@@ -885,7 +928,7 @@ def _parse_params(param_str: str) -> dict:
     if not param_str.strip():
         return params
     # Split on commas, respecting quoted strings
-    parts = re.findall(r'(\w[\w.]*)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|(\S+))', param_str)
+    parts = re.findall(r'(\w[\w.]*)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s,]+))', param_str)
     for key, v1, v2, v3 in parts:
         val = v1 or v2 or v3
         # Type coercion
@@ -939,12 +982,6 @@ def _apply_replay_profile(results: list, frame: dict, filters: dict):
                     entity["_suspended"] = True
                     break
 
-    # Boundary stance (Update 5c)
-    boundary_stance = replay.get("boundary", "respect")
-    if boundary_stance == "unified":
-        # Remove any _seg.boundary filter — already handled by filters dict
-        pass  # Filtering already happened; unified means we don't re-filter
-
 
 def _exec_state(db: sqlite3.Connection, query: dict) -> dict:
     """Execute a state() query against the projection (or replay for time-travel)."""
@@ -953,12 +990,37 @@ def _exec_state(db: sqlite3.Connection, query: dict) -> dict:
     frame = query.get("frame", {})
     tbl = filters.get("context.table", "_default")
 
+    # Boundary stance: unified mode ignores SEG boundary filters
+    replay = frame.get("replay", {}) if frame else {}
+    if replay.get("boundary") == "unified" and "_seg.boundary" in filters:
+        filters = {k: v for k, v in filters.items() if k != "_seg.boundary"}
+
     if at:
         # Time-travel: find nearest snapshot, replay forward
         return _exec_state_at(db, tbl, filters, at)
 
+    # Cross-table target.id lookup: when id specified but no table, search all tables
+    cross_table = ("target.id" in filters and "context.table" not in filters)
+
     # Current state: read from projection (Update 4c/4d: dead entity filters)
-    if filters.get("_only_dead"):
+    if cross_table:
+        eid = filters["target.id"]
+        if filters.get("_only_dead"):
+            rows = db.execute(
+                "SELECT entity_id, tbl as _tbl, data, alive FROM _projected WHERE entity_id=? AND alive=0",
+                (eid,)
+            ).fetchall()
+        elif filters.get("_include_dead"):
+            rows = db.execute(
+                "SELECT entity_id, tbl as _tbl, data, alive FROM _projected WHERE entity_id=?",
+                (eid,)
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT entity_id, tbl as _tbl, data FROM _projected WHERE entity_id=? AND alive=1",
+                (eid,)
+            ).fetchall()
+    elif filters.get("_only_dead"):
         rows = db.execute(
             "SELECT entity_id, data, alive FROM _projected WHERE tbl=? AND alive=0",
             (tbl,)
@@ -978,6 +1040,9 @@ def _exec_state(db: sqlite3.Connection, query: dict) -> dict:
     for row in rows:
         data = json.loads(row["data"])
         entity = {"id": row["entity_id"], **data}
+        # Include table info for cross-table queries
+        if cross_table:
+            entity["_table"] = row["_tbl"]
         # Mark dead entities when included
         if filters.get("_include_dead") or filters.get("_only_dead"):
             entity["_alive"] = bool(row["alive"])
@@ -986,7 +1051,8 @@ def _exec_state(db: sqlite3.Connection, query: dict) -> dict:
         if _matches_filters(entity, filters):
             results.append(entity)
 
-    result = {"type": "state", "table": tbl, "count": len(results), "entities": results}
+    result = {"type": "state", "table": tbl if not cross_table else "_cross",
+              "count": len(results), "entities": results}
 
     # Apply replay profile post-processing (Update 5)
     _apply_replay_profile(results, frame, filters)
@@ -1081,6 +1147,10 @@ def _exec_stream(db: sqlite3.Connection, query: dict) -> dict:
     if "before" in filters:
         conditions.append("ts<?")
         params.append(filters["before"])
+    # Support context.table filter via json_extract
+    if "context.table" in filters:
+        conditions.append("json_extract(context, '$.table')=?")
+        params.append(filters["context.table"])
     if "limit" not in filters:
         filters["limit"] = 100
 
@@ -1090,12 +1160,26 @@ def _exec_stream(db: sqlite3.Connection, query: dict) -> dict:
     rows = db.execute(sql, params).fetchall()
     ops = []
     for row in rows:
-        ops.append({
+        op_data = {
             "id": row["id"], "ts": row["ts"], "op": row["op"],
             "target": json.loads(row["target"]),
             "context": json.loads(row["context"]),
             "frame": json.loads(row["frame"])
-        })
+        }
+        # Apply remaining dotted filters client-side (target.*, context.*)
+        match = True
+        for key, val in filters.items():
+            if key in ("op", "after", "before", "limit", "context.table"):
+                continue
+            parts = key.split(".", 1)
+            if len(parts) == 2:
+                scope, field = parts
+                if scope in ("target", "context", "frame"):
+                    if op_data.get(scope, {}).get(field) != val:
+                        match = False
+                        break
+        if match:
+            ops.append(op_data)
 
     return {"type": "stream", "count": len(ops), "operations": ops}
 
@@ -1104,6 +1188,8 @@ def _exec_con_chain(db: sqlite3.Connection, base_result: dict, chain: dict) -> d
     """BFS over _con_edges from base result entities."""
     hops = chain.get("hops", 1)
     min_coupling = chain.get("min_coupling", 0)
+    stance_filter = chain.get("stance")       # only follow this stance
+    exclude_filter = chain.get("exclude")     # exclude this stance
 
     seed_ids = {e["id"] for e in base_result.get("entities", [])}
     visited = set(seed_ids)
@@ -1114,15 +1200,22 @@ def _exec_con_chain(db: sqlite3.Connection, base_result: dict, chain: dict) -> d
         next_frontier = set()
         for eid in frontier:
             rows = db.execute(
-                "SELECT source_id, target_id, coupling, data FROM _con_edges "
+                "SELECT source_id, target_id, stance, coupling, data FROM _con_edges "
                 "WHERE (source_id=? OR target_id=?) AND alive=1 AND coupling>=?",
                 (eid, eid, min_coupling)
             ).fetchall()
             for row in rows:
+                # Stance filtering
+                edge_stance = row["stance"] or "accidental"
+                if stance_filter and edge_stance != stance_filter:
+                    continue
+                if exclude_filter and edge_stance == exclude_filter:
+                    continue
                 other = row["target_id"] if row["source_id"] == eid else row["source_id"]
                 edges_found.append({
                     "source": row["source_id"], "target": row["target_id"],
-                    "coupling": row["coupling"], "data": json.loads(row["data"])
+                    "stance": edge_stance, "coupling": row["coupling"],
+                    "data": json.loads(row["data"])
                 })
                 if other not in visited:
                     visited.add(other)
@@ -1140,12 +1233,17 @@ def _exec_con_chain(db: sqlite3.Connection, base_result: dict, chain: dict) -> d
             data = json.loads(row["data"])
             reached_entities.append({"id": eid, "table": row["tbl"], **data})
 
-    base_result["con_chain"] = {
+    chain_meta = {
         "hops": hops, "min_coupling": min_coupling,
         "reached": reached_entities,
         "edges": edges_found,
         "reached_count": len(reached_entities)
     }
+    if stance_filter:
+        chain_meta["stance"] = stance_filter
+    if exclude_filter:
+        chain_meta["exclude"] = exclude_filter
+    base_result["con_chain"] = chain_meta
     return base_result
 
 
@@ -1598,20 +1696,22 @@ DEMO_SEED = {
         {"ts": "2025-03-10T10:00:00Z", "op": "INS", "target": {"id": "ev2", "name": "Park Cleanup", "type": "community", "date": "2025-03-20"}, "context": {"table": "events"}, "frame": {}},
         {"ts": "2025-04-01T10:00:00Z", "op": "INS", "target": {"id": "ev3", "name": "Pizza & Poetry", "type": "literary", "date": "2025-04-10"}, "context": {"table": "events"}, "frame": {}},
 
-        # --- CON: constitutive (high coupling) ---
-        {"ts": "2025-01-05T12:00:00Z", "op": "CON", "target": {"source": "pe0", "target": "pe1", "coupling": 0.9, "type": "partners"}, "context": {"table": "people"}, "frame": {}},
-        {"ts": "2025-01-20T12:00:00Z", "op": "CON", "target": {"source": "pe0", "target": "pl0", "coupling": 0.8, "type": "performs_at"}, "context": {"table": "cross"}, "frame": {}},
-        {"ts": "2025-01-20T12:01:00Z", "op": "CON", "target": {"source": "pe1", "target": "pl1", "coupling": 0.85, "type": "works_at"}, "context": {"table": "cross"}, "frame": {}},
+        # --- CON: essential (structural dependence) ---
+        {"ts": "2025-01-05T12:00:00Z", "op": "CON", "target": {"source": "pe0", "target": "pe1", "coupling": 0.9, "stance": "essential", "type": "partners"}, "context": {"table": "people"}, "frame": {}},
+        {"ts": "2025-01-20T12:01:00Z", "op": "CON", "target": {"source": "pe1", "target": "pl1", "coupling": 0.85, "stance": "essential", "type": "works_at"}, "context": {"table": "cross"}, "frame": {}},
+        {"ts": "2025-01-25T20:01:00Z", "op": "CON", "target": {"source": "pe3", "target": "pl4", "coupling": 0.7, "stance": "essential", "type": "works_at"}, "context": {"table": "cross"}, "frame": {}},
+        {"ts": "2025-03-01T10:00:00Z", "op": "CON", "target": {"source": "pe7", "target": "pl6", "coupling": 0.75, "stance": "essential", "type": "works_at"}, "context": {"table": "cross"}, "frame": {}},
+        {"ts": "2025-03-10T10:00:00Z", "op": "CON", "target": {"source": "ev0", "target": "pl0", "coupling": 0.8, "stance": "essential", "type": "hosted_at"}, "context": {"table": "cross"}, "frame": {}},
+        {"ts": "2025-03-10T10:01:00Z", "op": "CON", "target": {"source": "ev1", "target": "pl5", "coupling": 0.7, "stance": "essential", "type": "hosted_at"}, "context": {"table": "cross"}, "frame": {}},
 
-        # --- CON: associative (low coupling) ---
-        {"ts": "2025-01-25T20:00:00Z", "op": "CON", "target": {"source": "pe2", "target": "pl3", "coupling": 0.5, "type": "frequents"}, "context": {"table": "cross"}, "frame": {}},
-        {"ts": "2025-01-25T20:01:00Z", "op": "CON", "target": {"source": "pe3", "target": "pl4", "coupling": 0.7, "type": "works_at"}, "context": {"table": "cross"}, "frame": {}},
-        {"ts": "2025-02-01T10:00:00Z", "op": "CON", "target": {"source": "pe4", "target": "ev2", "coupling": 0.6, "type": "organizes"}, "context": {"table": "cross"}, "frame": {}},
-        {"ts": "2025-02-15T10:00:00Z", "op": "CON", "target": {"source": "pe5", "target": "pe3", "coupling": 0.4, "type": "knows"}, "context": {"table": "cross"}, "frame": {}},
-        {"ts": "2025-02-20T10:00:00Z", "op": "CON", "target": {"source": "pe6", "target": "pe1", "coupling": 0.55, "type": "mentored_by"}, "context": {"table": "cross"}, "frame": {}},
-        {"ts": "2025-03-01T10:00:00Z", "op": "CON", "target": {"source": "pe7", "target": "pl6", "coupling": 0.75, "type": "works_at"}, "context": {"table": "cross"}, "frame": {}},
-        {"ts": "2025-03-10T10:00:00Z", "op": "CON", "target": {"source": "ev0", "target": "pl0", "coupling": 0.8, "type": "hosted_at"}, "context": {"table": "cross"}, "frame": {}},
-        {"ts": "2025-03-10T10:01:00Z", "op": "CON", "target": {"source": "ev1", "target": "pl5", "coupling": 0.7, "type": "hosted_at"}, "context": {"table": "cross"}, "frame": {}},
+        # --- CON: generative (productive relation) ---
+        {"ts": "2025-01-20T12:00:00Z", "op": "CON", "target": {"source": "pe0", "target": "pl0", "coupling": 0.8, "stance": "generative", "type": "performs_at"}, "context": {"table": "cross"}, "frame": {}},
+        {"ts": "2025-02-01T10:00:00Z", "op": "CON", "target": {"source": "pe4", "target": "ev2", "coupling": 0.6, "stance": "generative", "type": "organizes"}, "context": {"table": "cross"}, "frame": {}},
+        {"ts": "2025-02-20T10:00:00Z", "op": "CON", "target": {"source": "pe6", "target": "pe1", "coupling": 0.55, "stance": "generative", "type": "mentored_by"}, "context": {"table": "cross"}, "frame": {}},
+
+        # --- CON: accidental (contingent association) ---
+        {"ts": "2025-01-25T20:00:00Z", "op": "CON", "target": {"source": "pe2", "target": "pl3", "coupling": 0.5, "stance": "accidental", "type": "frequents"}, "context": {"table": "cross"}, "frame": {}},
+        {"ts": "2025-02-15T10:00:00Z", "op": "CON", "target": {"source": "pe5", "target": "pe3", "coupling": 0.4, "stance": "accidental", "type": "knows"}, "context": {"table": "cross"}, "frame": {}},
 
         # --- SUP: contradictory data (Time triad — layering) ---
         {"ts": "2025-04-15T10:00:00Z", "op": "SUP", "target": {"id": "pl7", "field": "capacity", "variants": [{"source": "permit", "value": 120}, {"source": "website", "value": 85}]}, "context": {"table": "places"}, "frame": {}},
@@ -1633,8 +1733,8 @@ DEMO_SEED = {
         {"ts": "2025-05-15T10:01:00Z", "op": "INS", "target": {"id": "type-person", "label": "Person", "fields": ["name", "role"]}, "context": {"table": "_types"}, "frame": {"authority": "michael", "epistemic": "meant"}},
         {"ts": "2025-05-15T10:02:00Z", "op": "INS", "target": {"id": "type-event", "label": "Event", "fields": ["name", "type", "date"]}, "context": {"table": "_types"}, "frame": {"authority": "michael", "epistemic": "meant"}},
         # CON between types
-        {"ts": "2025-05-15T10:03:00Z", "op": "CON", "target": {"source": "type-person", "target": "type-place", "coupling": 0.7, "type": "frequents"}, "context": {"table": "_types"}, "frame": {"authority": "michael"}},
-        {"ts": "2025-05-15T10:04:00Z", "op": "CON", "target": {"source": "type-event", "target": "type-place", "coupling": 0.8, "type": "hosted_at"}, "context": {"table": "_types"}, "frame": {"authority": "michael"}},
+        {"ts": "2025-05-15T10:03:00Z", "op": "CON", "target": {"source": "type-person", "target": "type-place", "coupling": 0.7, "stance": "accidental", "type": "frequents"}, "context": {"table": "_types"}, "frame": {"authority": "michael"}},
+        {"ts": "2025-05-15T10:04:00Z", "op": "CON", "target": {"source": "type-event", "target": "type-place", "coupling": 0.8, "stance": "essential", "type": "hosted_at"}, "context": {"table": "_types"}, "frame": {"authority": "michael"}},
 
         # --- Named replay profile (Update 5d) ---
         {"ts": "2025-05-20T10:00:00Z", "op": "INS", "target": {"id": "profile-investigative", "conflict": "preserve", "boundary": "unified", "temporal": "asOf"}, "context": {"table": "_rules"}, "frame": {"authority": "michael"}},
@@ -1757,11 +1857,16 @@ def get_gaps(instance, tbl):
         (tbl,)
     ).fetchall()
 
+    # Operator-typed absence: every operator implies its own form of missing
     gaps = {
-        "never_designated": [],
-        "never_connected": [],
-        "has_contradictions": [],
-        "never_validated": [],
+        "never_designated": [],    # ¬DES — no frame applied
+        "never_connected": [],     # ¬CON — structurally isolated
+        "never_segmented": [],     # ¬SEG — no boundary assigned
+        "never_synthesized": [],   # ¬SYN — not merged
+        "pending_transition": [],  # ¬ALT — no state transitions yet
+        "has_contradictions": [],  # SUP present — ambiguity held
+        "has_destroyed_fields": [],# NUL on fields — explicit destruction
+        "never_validated": [],     # ¬REC — not part of feedback loop
     }
 
     for row in rows:
@@ -1773,8 +1878,18 @@ def get_gaps(instance, tbl):
             gaps["never_designated"].append(eid)
         if "CON" not in ops:
             gaps["never_connected"].append(eid)
-        if any(isinstance(v, dict) and "_sup" in v for v in data.values()):
+        if "SEG" not in ops:
+            gaps["never_segmented"].append(eid)
+        if "SYN" not in ops:
+            gaps["never_synthesized"].append(eid)
+        if "ALT" not in ops:
+            gaps["pending_transition"].append(eid)
+        if any(isinstance(v, dict) and "_sup" in v
+               for k, v in data.items() if not k.startswith("_")):
             gaps["has_contradictions"].append(eid)
+        if any(isinstance(v, dict) and "_nul" in v
+               for k, v in data.items() if not k.startswith("_")):
+            gaps["has_destroyed_fields"].append(eid)
         if "REC" not in ops:
             gaps["never_validated"].append(eid)
 
@@ -1789,7 +1904,7 @@ def index():
     return jsonify({
         "name": "Choreo Runtime",
         "ui": "/ui",
-        "version": "2.0",
+        "version": "2.1",
         "operators": {
             "cascade": OPERATOR_CASCADE,
             "triads": OPERATOR_TRIADS,

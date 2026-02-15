@@ -30,7 +30,7 @@ Every operation uses exactly one of these nine operators, organized in three tri
 | **Identity** | `NUL` | Destruction / absence | Marks entity as dead. Kills associated CON edges. Can also NUL individual fields. |
 | | `DES` | Designation / naming | Stores designations in a `_des` namespace on the entity. Also used for queries. |
 | | `INS` | Instantiation | Creates an entity or merges fields into an existing one. |
-| **Space** | `SEG` | Segmentation / filtering | Records boundary metadata. Mainly used at query time. |
+| **Structure** | `SEG` | Segmentation / filtering | Records boundary metadata. Mainly used at query time. |
 | | `CON` | Connection / joining | Creates an edge between two entities with a coupling strength (0.0–1.0). |
 | | `SYN` | Synthesis / merging | Merges entity B into entity A. B is killed, its edges are reassigned to A. |
 | **Time** | `ALT` | Alternation / transition | Updates specific fields on an existing entity. |
@@ -41,14 +41,17 @@ Every operation uses exactly one of these nine operators, organized in three tri
 
 Choreo supports multiple isolated databases called instances. Each instance has its own operations log, projected state, and CON graph. An instance is a single SQLite file.
 
-### CON coupling
+### CON stance & coupling
 
-Every CON edge has a `coupling` value from 0.0 to 1.0. This is a spectrum, not a boolean:
+Every CON edge carries a **dialectical stance** that describes the nature of the connection:
 
-- **Associative** (low coupling, ~0.1–0.4): "person lives at address", "event happened at venue"
-- **Constitutive** (high coupling, ~0.7–1.0): "expenditure funded by grant", "petitioner named in case"
+- **Accidental**: The connection is contingent. "Person frequents venue." Remove it and both entities remain fully coherent.
+- **Essential**: The connection is necessary. "Expenditure funded by grant." Remove it and one or both entities lose their identity.
+- **Generative**: The connection produces something neither entity has alone. "Co-investigators on a story." It's productive — it generates a capacity that only exists because of the relation.
 
-The coupling value is data, not decoration. It affects graph traversal queries (`min_coupling` filter) and the UI uses it to render edge thickness and constitutive grouping.
+Stance-based filtering is the primary query mechanism: `>> CON(hops=2, stance="essential")` or `>> CON(hops=2, exclude="accidental")`.
+
+Every CON edge also retains a `coupling` float from 0.0 to 1.0 for backward compatibility. When a CON operation includes an explicit `stance`, it's stored directly. When stance is absent, it's inferred from coupling (≥0.7 → essential, ≥0.55 → generative, else accidental). The `min_coupling` filter remains available for hybrid queries.
 
 ---
 
@@ -215,6 +218,7 @@ Field-level destruction:
     "source": "pl0",
     "target": "pe0",
     "coupling": 0.7,
+    "stance": "essential",
     "type": "works_at"
   },
   "context": {"table": "places"}
@@ -222,6 +226,7 @@ Field-level destruction:
 ```
 
 - `source` and `target` are entity IDs. They can be in different tables.
+- `stance` is `"accidental"`, `"essential"`, or `"generative"`. If omitted, inferred from coupling.
 - `coupling` is a float from 0.0 to 1.0. Default is 0.5.
 - Any additional fields in `target` (like `type`) are stored as edge metadata.
 - CON edges are directional but traversal queries follow them in both directions.
@@ -640,11 +645,15 @@ Syntactic sugar for querying the system's own structure.
 
 ```
 state(target.id = "pl0") >> CON(hops = 2)
+state(target.id = "pl0") >> CON(hops = 2, stance = "essential")
+state(target.id = "pl0") >> CON(hops = 2, exclude = "accidental")
 state(target.id = "pl0") >> CON(hops = 1, min_coupling = 0.5)
 ```
 
 - Follows CON edges outward from the result entities via BFS.
 - `hops` controls traversal depth (default 1).
+- `stance` filters to only follow edges with the specified stance.
+- `exclude` excludes edges with the specified stance.
 - `min_coupling` filters edges below the threshold (default 0).
 - Returns the base result plus a `con_chain` object:
 
@@ -656,14 +665,14 @@ state(target.id = "pl0") >> CON(hops = 1, min_coupling = 0.5)
   "entities": [{"id": "pl0", "name": "Listening Room", ...}],
   "con_chain": {
     "hops": 2,
-    "min_coupling": 0,
+    "stance": "essential",
     "reached": [
       {"id": "pe0", "table": "people", "name": "Tomás", "role": "musician"},
       {"id": "ev0", "table": "events", "name": "Open Mic Night"}
     ],
     "edges": [
-      {"source": "pl0", "target": "pe0", "coupling": 0.7, "data": {"type": "works_at"}},
-      {"source": "ev0", "target": "pl0", "coupling": 0.4, "data": {"type": "hosted_at"}}
+      {"source": "pl0", "target": "pe0", "stance": "essential", "coupling": 0.7, "data": {"type": "works_at"}},
+      {"source": "ev0", "target": "pl0", "stance": "essential", "coupling": 0.8, "data": {"type": "hosted_at"}}
     ],
     "reached_count": 2
   }
@@ -1162,7 +1171,11 @@ Returns entities grouped by which operators have NOT been applied — operator-t
   "gaps": {
     "never_designated": ["pl1", "pl2", "pl3"],
     "never_connected": ["pl4", "pl7"],
+    "never_segmented": ["pl0", "pl2", "pl7"],
+    "never_synthesized": ["pl0", "pl1", "pl2", "pl3"],
+    "pending_transition": ["pl2"],
     "has_contradictions": ["pl7"],
+    "has_destroyed_fields": [],
     "never_validated": ["pl0", "pl1", "pl2"]
   }
 }
@@ -1205,7 +1218,7 @@ Each `.db` file contains:
 
 ```bash
 # Generate nginx config with SSE-aware proxy settings
-python3 choreo.py --nginx choreo.yourdomain.com > /etc/nginx/sites-available/choreo
+python3 choreo_runtime.py --nginx choreo.yourdomain.com > /etc/nginx/sites-available/choreo
 
 # Enable and get SSL
 ln -s /etc/nginx/sites-available/choreo /etc/nginx/sites-enabled/
@@ -1213,7 +1226,7 @@ certbot --nginx -d choreo.yourdomain.com
 systemctl reload nginx
 
 # Run with PM2
-pm2 start choreo.py --interpreter python3 -- --port 8420 --dir /home/admin/choreo/instances
+pm2 start choreo_runtime.py --interpreter python3 -- --port 8420 --dir /home/admin/choreo/instances
 pm2 save && pm2 startup
 ```
 
