@@ -3,7 +3,7 @@
 EOQL (EO Query Language) is how you ask Choreo questions. Queries are operations — when you query, you perform a DES (designate your attention). Send EOQL queries by POSTing to the operations endpoint:
 
 ```bash
-curl -X POST localhost:8420/my-instance/operations \
+curl -X POST https://choreo.intelechia.com/my-instance/operations \
   -H "Content-Type: application/json" \
   -d '{
     "op": "DES",

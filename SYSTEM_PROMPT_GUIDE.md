@@ -12,7 +12,7 @@ Choreo is an append-only event store. You write **operations** to it (there are 
 
 ## Connection Details
 
-- **Base URL**: `http://localhost:8420` (default; configurable)
+- **Base URL**: `https://choreo.intelechia.com` (default; configurable)
 - **Content-Type**: Always `application/json` for requests and responses
 - **CORS**: Enabled on all endpoints
 - **Auth**: None (designed for local/trusted network use)
@@ -744,7 +744,7 @@ data: {"id":48,"ts":"2026-02-15T16:22:01.000Z","op":"ALT","target":{"id":"pl0","
 
 **JavaScript:**
 ```javascript
-const sse = new EventSource("http://localhost:8420/my-instance/stream");
+const sse = new EventSource("https://choreo.intelechia.com/my-instance/stream");
 sse.addEventListener("op", (event) => {
   const op = JSON.parse(event.data);
   console.log(op.op, op.target, op.context);
@@ -754,7 +754,7 @@ sse.addEventListener("op", (event) => {
 **Python:**
 ```python
 import requests, json
-with requests.get("http://localhost:8420/my-instance/stream", stream=True) as r:
+with requests.get("https://choreo.intelechia.com/my-instance/stream", stream=True) as r:
     for line in r.iter_lines():
         if line and line.startswith(b"data: "):
             op = json.loads(line[6:])
@@ -1110,7 +1110,7 @@ Copy-paste templates for every operator:
 ```python
 import requests
 
-BASE = "http://localhost:8420"
+BASE = "https://choreo.intelechia.com"
 INST = "my-project"
 
 # Create instance

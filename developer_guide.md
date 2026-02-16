@@ -57,7 +57,7 @@ Every CON edge also retains a `coupling` float from 0.0 to 1.0 for backward comp
 
 ## API Reference
 
-Base URL: `http://localhost:8420` (default, configurable via `CHOREO_PORT` env var or `--port` flag).
+Base URL: `https://choreo.intelechia.com` (default, configurable via `CHOREO_PORT` env var or `--port` flag).
 
 All request and response bodies are JSON. All endpoints support CORS.
 
@@ -470,7 +470,7 @@ data: {"id":48,"ts":"2026-02-15T16:22:01.000Z","op":"ALT","target":{"id":"pl0","
 
 JavaScript example:
 ```javascript
-const sse = new EventSource("http://localhost:8420/my-instance/stream");
+const sse = new EventSource("https://choreo.intelechia.com/my-instance/stream");
 
 sse.addEventListener("op", (event) => {
   const op = JSON.parse(event.data);
@@ -487,7 +487,7 @@ Python example:
 ```python
 import requests, json
 
-with requests.get("http://localhost:8420/my-instance/stream", stream=True) as r:
+with requests.get("https://choreo.intelechia.com/my-instance/stream", stream=True) as r:
     for line in r.iter_lines():
         if line and line.startswith(b"data: "):
             op = json.loads(line[6:])
@@ -817,7 +817,7 @@ scraped_rows = [
     {"name": "New Coffee Shop", "hours": "7a-4p", "status": "open"},
 ]
 
-response = requests.post("http://localhost:8420/my-instance/operations", json={
+response = requests.post("https://choreo.intelechia.com/my-instance/operations", json={
     "op": "REC",
     "target": {"rows": scraped_rows},
     "context": {"type": "snapshot_ingest", "table": "places"},
@@ -842,7 +842,7 @@ Connect to the SSE stream and update your UI on every operation.
 
 ```javascript
 const INSTANCE = "my-instance";
-const BASE = "http://localhost:8420";
+const BASE = "https://choreo.intelechia.com";
 
 // Load initial state
 async function loadState(table) {
@@ -879,7 +879,7 @@ connectStream((op) => {
 **Choreo → n8n** (event-driven): Register an outbound webhook. In n8n, create a Webhook trigger node and use the production URL.
 
 ```bash
-curl -X POST http://localhost:8420/my-instance/webhooks \
+curl -X POST https://choreo.intelechia.com/my-instance/webhooks \
   -H "Content-Type: application/json" \
   -d '{"url": "https://n8n.example.com/webhook/abc123", "filter": ["ALT", "NUL"]}'
 ```
@@ -889,7 +889,7 @@ curl -X POST http://localhost:8420/my-instance/webhooks \
 ```json
 {
   "method": "POST",
-  "url": "http://localhost:8420/my-instance/operations",
+  "url": "https://choreo.intelechia.com/my-instance/operations",
   "body": {
     "op": "INS",
     "target": {
@@ -912,7 +912,7 @@ Compare state at two points in time:
 import requests
 
 def state_at(instance, table, timestamp):
-    r = requests.get(f"http://localhost:8420/{instance}/state/{table}",
+    r = requests.get(f"https://choreo.intelechia.com/{instance}/state/{table}",
                      params={"at": timestamp})
     return {e["id"]: e for e in r.json()["entities"]}
 
@@ -939,7 +939,7 @@ Find everything connected to an entity within N hops:
 ```python
 import requests
 
-r = requests.post("http://localhost:8420/my-instance/operations", json={
+r = requests.post("https://choreo.intelechia.com/my-instance/operations", json={
     "op": "DES",
     "target": {"query": 'state(target.id = "pl0") >> CON(hops = 2, min_coupling = 0.3)'},
     "context": {"type": "query"}
@@ -1218,11 +1218,11 @@ Each `.db` file contains:
 
 ```bash
 # Generate nginx config with SSE-aware proxy settings
-python3 choreo_runtime.py --nginx choreo.yourdomain.com > /etc/nginx/sites-available/choreo
+python3 choreo_runtime.py --nginx choreo.intelechia.com > /etc/nginx/sites-available/choreo
 
 # Enable and get SSL
 ln -s /etc/nginx/sites-available/choreo /etc/nginx/sites-enabled/
-certbot --nginx -d choreo.yourdomain.com
+certbot --nginx -d choreo.intelechia.com
 systemctl reload nginx
 
 # Run with PM2
