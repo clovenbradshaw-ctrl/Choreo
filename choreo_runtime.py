@@ -16,7 +16,7 @@ Plus instance management:
 Run: python choreo_runtime.py [--port 8420] [--dir ./instances]
 """
 
-import sqlite3, json, os, re, time, sys, threading, hashlib
+import sqlite3, json, os, re, time, sys, threading, hashlib, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from flask import Flask, request, jsonify, Response
@@ -98,6 +98,29 @@ def cors_preflight(p=""):
 # ---------------------------------------------------------------------------
 _local = threading.local()
 
+def _migrate_operations_table(db: sqlite3.Connection):
+    """Add pretty_id and guid columns to existing databases that lack them."""
+    cols = {row[1] for row in db.execute("PRAGMA table_info(operations)").fetchall()}
+    if "guid" not in cols:
+        db.execute("ALTER TABLE operations ADD COLUMN guid TEXT")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_guid ON operations(guid)")
+        # Backfill existing rows with generated GUIDs
+        rows = db.execute("SELECT id FROM operations WHERE guid IS NULL ORDER BY id").fetchall()
+        for row in rows:
+            db.execute("UPDATE operations SET guid=? WHERE id=?",
+                       (str(uuid.uuid4()), row["id"]))
+    if "pretty_id" not in cols:
+        db.execute("ALTER TABLE operations ADD COLUMN pretty_id TEXT")
+        # Backfill existing rows with pretty IDs derived from target name/id
+        rows = db.execute("SELECT id, target FROM operations WHERE pretty_id IS NULL ORDER BY id").fetchall()
+        for row in rows:
+            target = json.loads(row["target"]) if row["target"] else {}
+            prefix = _make_pretty_prefix(target)
+            db.execute("UPDATE operations SET pretty_id=? WHERE id=?",
+                       (f"{prefix}-{row['id']}", row["id"]))
+    db.commit()
+
+
 def get_db(instance: str) -> sqlite3.Connection:
     """Get or create a SQLite connection for this instance in this thread."""
     key = f"db_{instance}"
@@ -110,6 +133,7 @@ def get_db(instance: str) -> sqlite3.Connection:
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA synchronous=NORMAL")
+        _migrate_operations_table(db)
         setattr(_local, key, db)
     return db
 
@@ -126,15 +150,18 @@ def init_db(instance: str) -> sqlite3.Connection:
     db.executescript("""
         -- The source of truth: append-only operations log
         CREATE TABLE IF NOT EXISTS operations (
-            id      INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            op      TEXT NOT NULL CHECK(op IN('INS','DES','SEG','CON','SYN','ALT','SUP','REC','NUL')),
-            target  TEXT NOT NULL DEFAULT '{}',
-            context TEXT NOT NULL DEFAULT '{}',
-            frame   TEXT NOT NULL DEFAULT '{}'
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            pretty_id TEXT,
+            guid      TEXT NOT NULL,
+            ts        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            op        TEXT NOT NULL CHECK(op IN('INS','DES','SEG','CON','SYN','ALT','SUP','REC','NUL')),
+            target    TEXT NOT NULL DEFAULT '{}',
+            context   TEXT NOT NULL DEFAULT '{}',
+            frame     TEXT NOT NULL DEFAULT '{}'
         );
         CREATE INDEX IF NOT EXISTS idx_ops_ts ON operations(ts);
         CREATE INDEX IF NOT EXISTS idx_ops_op ON operations(op);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_guid ON operations(guid);
 
         -- Materialized projection: derived, disposable, rebuildable
         CREATE TABLE IF NOT EXISTS _projected (
@@ -190,6 +217,43 @@ def init_db(instance: str) -> sqlite3.Connection:
 
     setattr(_local, f"db_{instance}", db)
     return db
+
+
+def _make_pretty_prefix(target: dict) -> str:
+    """Derive a 3-character uppercase prefix from the target's name or id."""
+    name = target.get("name") or target.get("id") or ""
+    name = str(name).strip()
+    if not name:
+        return "OP"
+    # Take first 3 alphanumeric characters, uppercase
+    chars = [c for c in name.upper() if c.isalnum()]
+    return "".join(chars[:3]) or "OP"
+
+
+def _insert_op(db: sqlite3.Connection, op: str, target: dict, context: dict,
+               frame: dict, ts: str = None) -> tuple:
+    """Insert an operation with auto-generated pretty_id and guid.
+    Returns (op_id, pretty_id, guid)."""
+    op_guid = str(uuid.uuid4())
+    if ts:
+        cursor = db.execute(
+            "INSERT INTO operations(ts, op, target, context, frame, guid) "
+            "VALUES(?,?,?,?,?,?)",
+            (ts, op, json.dumps(target), json.dumps(context),
+             json.dumps(frame), op_guid)
+        )
+    else:
+        cursor = db.execute(
+            "INSERT INTO operations(op, target, context, frame, guid) "
+            "VALUES(?,?,?,?,?)",
+            (op, json.dumps(target), json.dumps(context),
+             json.dumps(frame), op_guid)
+        )
+    op_id = cursor.lastrowid
+    prefix = _make_pretty_prefix(target)
+    pretty_id = f"{prefix}-{op_id}"
+    db.execute("UPDATE operations SET pretty_id=? WHERE id=?", (pretty_id, op_id))
+    return op_id, pretty_id, op_guid
 
 
 # ---------------------------------------------------------------------------
@@ -681,11 +745,8 @@ def _handle_snapshot_ingest(db, rec_op_id, target, context, frame):
 
     # Append generated ops and project them
     for g_op, g_target, g_context, g_frame in generated_ops:
-        cursor = db.execute(
-            "INSERT INTO operations(op, target, context, frame) VALUES(?,?,?,?)",
-            (g_op, json.dumps(g_target), json.dumps(g_context), json.dumps(g_frame))
-        )
-        project_op(db, cursor.lastrowid, g_op, g_target, g_context, g_frame)
+        g_op_id, _, _ = _insert_op(db, g_op, g_target, g_context, g_frame)
+        project_op(db, g_op_id, g_op, g_target, g_context, g_frame)
 
     return generated_ops
 
@@ -770,12 +831,9 @@ def _evaluate_rules(db, op_id: int, op: str, target: dict, context: dict, frame:
         generated_context["generated_by_rule"] = rule_row["entity_id"]
 
         # Append and project the generated operation
-        cursor = db.execute(
-            "INSERT INTO operations(op, target, context, frame) VALUES(?,?,?,?)",
-            (action["op"], json.dumps(generated_target),
-             json.dumps(generated_context), json.dumps({}))
-        )
-        project_op(db, cursor.lastrowid, action["op"],
+        g_op_id, _, _ = _insert_op(db, action["op"], generated_target,
+                                   generated_context, {})
+        project_op(db, g_op_id, action["op"],
                    generated_target, generated_context, {})
 
 
@@ -849,11 +907,8 @@ def _handle_emergence_scan(db, op_id: int, target: dict, context: dict, frame: d
             "table": "_emergent",
             "generated_by": op_id
         }
-        cursor = db.execute(
-            "INSERT INTO operations(op, target, context, frame) VALUES(?,?,?,?)",
-            ("DES", json.dumps(des_target), json.dumps(des_context), json.dumps(frame))
-        )
-        project_op(db, cursor.lastrowid, "DES", des_target, des_context, frame)
+        g_op_id, _, _ = _insert_op(db, "DES", des_target, des_context, frame)
+        project_op(db, g_op_id, "DES", des_target, des_context, frame)
         generated_ops.append({"op": "DES", "target": des_target})
 
     return generated_ops
@@ -1154,14 +1209,15 @@ def _exec_stream(db: sqlite3.Connection, query: dict) -> dict:
     if "limit" not in filters:
         filters["limit"] = 100
 
-    sql = f"SELECT id, ts, op, target, context, frame FROM operations WHERE {' AND '.join(conditions)} ORDER BY id DESC LIMIT ?"
+    sql = f"SELECT id, pretty_id, guid, ts, op, target, context, frame FROM operations WHERE {' AND '.join(conditions)} ORDER BY id DESC LIMIT ?"
     params.append(filters["limit"])
 
     rows = db.execute(sql, params).fetchall()
     ops = []
     for row in rows:
         op_data = {
-            "id": row["id"], "ts": row["ts"], "op": row["op"],
+            "id": row["id"], "pretty_id": row["pretty_id"], "guid": row["guid"],
+            "ts": row["ts"], "op": row["op"],
             "target": json.loads(row["target"]),
             "context": json.loads(row["context"]),
             "frame": json.loads(row["frame"])
@@ -1396,18 +1452,9 @@ def seed_instance(slug):
         frame = op_data.get("frame", {})
         ts = op_data.get("ts")
 
-        if ts:
-            cursor = db.execute(
-                "INSERT INTO operations(ts, op, target, context, frame) VALUES(?,?,?,?,?)",
-                (ts, op, json.dumps(target), json.dumps(context), json.dumps(frame))
-            )
-        else:
-            cursor = db.execute(
-                "INSERT INTO operations(op, target, context, frame) VALUES(?,?,?,?)",
-                (op, json.dumps(target), json.dumps(context), json.dumps(frame))
-            )
-        project_op(db, cursor.lastrowid, op, target, context, frame)
-        maybe_snapshot(db, cursor.lastrowid)
+        s_op_id, _, _ = _insert_op(db, op, target, context, frame, ts=ts)
+        project_op(db, s_op_id, op, target, context, frame)
+        maybe_snapshot(db, s_op_id)
         appended += 1
 
     db.commit()
@@ -1454,12 +1501,8 @@ def post_operation(instance):
         audit = frame.get("audit", False)
         audit_op_id = None
         if audit:
-            cursor = db.execute(
-                "INSERT INTO operations(op, target, context, frame) VALUES(?,?,?,?)",
-                (op, json.dumps(target), json.dumps(context), json.dumps(frame))
-            )
-            audit_op_id = cursor.lastrowid
-            project_op(db, cursor.lastrowid, op, target, context, frame)
+            audit_op_id, _, _ = _insert_op(db, op, target, context, frame)
+            project_op(db, audit_op_id, op, target, context, frame)
             db.commit()
 
         # Pass frame to _exec_state for replay profile support (Update 5)
@@ -1473,11 +1516,7 @@ def post_operation(instance):
         return jsonify(result)
 
     # --- Normal operation ---
-    cursor = db.execute(
-        "INSERT INTO operations(op, target, context, frame) VALUES(?,?,?,?)",
-        (op, json.dumps(target), json.dumps(context), json.dumps(frame))
-    )
-    op_id = cursor.lastrowid
+    op_id, op_pretty_id, op_guid = _insert_op(db, op, target, context, frame)
 
     # Project synchronously
     project_op(db, op_id, op, target, context, frame)
@@ -1492,24 +1531,25 @@ def post_operation(instance):
     if op == "REC" and context.get("type") == "snapshot_ingest":
         # Re-read the generated ops
         generated = db.execute(
-            "SELECT id, ts, op, target, context, frame FROM operations "
+            "SELECT id, pretty_id, guid, ts, op, target, context, frame FROM operations "
             "WHERE json_extract(context, '$.generated_by')=? ORDER BY id",
             (op_id,)
         ).fetchall()
         gen_list = [{
-            "id": r["id"], "ts": r["ts"], "op": r["op"],
+            "id": r["id"], "pretty_id": r["pretty_id"], "guid": r["guid"],
+            "ts": r["ts"], "op": r["op"],
             "target": json.loads(r["target"]),
             "context": json.loads(r["context"]),
             "frame": json.loads(r["frame"])
         } for r in generated]
         return jsonify({
-            "op_id": op_id, "op": op,
+            "op_id": op_id, "pretty_id": op_pretty_id, "guid": op_guid, "op": op,
             "generated": gen_list, "generated_count": len(gen_list)
         })
 
     # Return the appended operation
     ts = db.execute("SELECT ts FROM operations WHERE id=?", (op_id,)).fetchone()["ts"]
-    result = {"op_id": op_id, "ts": ts, "op": op}
+    result = {"op_id": op_id, "pretty_id": op_pretty_id, "guid": op_guid, "ts": ts, "op": op}
 
     # DES unframed warning (Update 1b)
     if op == "DES" and not frame:
@@ -1517,7 +1557,8 @@ def post_operation(instance):
 
     # Fire outbound webhooks (non-blocking)
     fire_webhooks(instance, {
-        "op_id": op_id, "ts": ts, "op": op,
+        "op_id": op_id, "pretty_id": op_pretty_id, "guid": op_guid,
+        "ts": ts, "op": op,
         "target": target, "context": context, "frame": frame
     })
 
@@ -1584,13 +1625,15 @@ def stream(instance):
         try:
             while True:
                 rows = conn.execute(
-                    "SELECT id, ts, op, target, context, frame FROM operations "
+                    "SELECT id, pretty_id, guid, ts, op, target, context, frame FROM operations "
                     "WHERE id > ? ORDER BY id LIMIT 50",
                     (seen,)
                 ).fetchall()
                 for row in rows:
                     data = json.dumps({
-                        "id": row["id"], "ts": row["ts"], "op": row["op"],
+                        "id": row["id"], "pretty_id": row["pretty_id"],
+                        "guid": row["guid"],
+                        "ts": row["ts"], "op": row["op"],
                         "target": json.loads(row["target"]),
                         "context": json.loads(row["context"]),
                         "frame": json.loads(row["frame"])
@@ -1767,11 +1810,8 @@ def seed_demo():
         context = op_data.get("context", {})
         frame = op_data.get("frame", {})
         ts = op_data.get("ts")
-        cursor = db.execute(
-            "INSERT INTO operations(ts, op, target, context, frame) VALUES(?,?,?,?,?)",
-            (ts, op, json.dumps(target), json.dumps(context), json.dumps(frame))
-        )
-        project_op(db, cursor.lastrowid, op, target, context, frame)
+        d_op_id, _, _ = _insert_op(db, op, target, context, frame, ts=ts)
+        project_op(db, d_op_id, op, target, context, frame)
     db.commit()
     count = db.execute("SELECT COUNT(*) as c FROM operations").fetchone()["c"]
     return jsonify({"instance": "demo", "operations": count, "seeded": True})
@@ -1802,7 +1842,7 @@ def get_biography(instance, eid):
 
     # All operations that mention this entity
     ops = db.execute(
-        "SELECT id, ts, op, target, context, frame FROM operations "
+        "SELECT id, pretty_id, guid, ts, op, target, context, frame FROM operations "
         "WHERE json_extract(target, '$.id')=? "
         "OR json_extract(target, '$.source')=? "
         "OR json_extract(target, '$.target')=? "
@@ -1814,7 +1854,8 @@ def get_biography(instance, eid):
     ).fetchall()
 
     history = [{
-        "id": r["id"], "ts": r["ts"], "op": r["op"],
+        "id": r["id"], "pretty_id": r["pretty_id"], "guid": r["guid"],
+        "ts": r["ts"], "op": r["op"],
         "target": json.loads(r["target"]),
         "context": json.loads(r["context"]),
         "frame": json.loads(r["frame"])
