@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  choreo:
+    build: .
+    container_name: choreo
+    restart: unless-stopped
+    ports:
+      - "8420:8420"
+    volumes:
+      - choreo-data:/data/instances
+    environment:
+      - CHOREO_PORT=8420
+      - CHOREO_DIR=/data/instances
+
+volumes:
+  choreo-data:
