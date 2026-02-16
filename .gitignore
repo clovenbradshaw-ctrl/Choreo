@@ -5,3 +5,5 @@ instances/
 *.db
 *.db-wal
 *.db-shm
+.env
+*.log

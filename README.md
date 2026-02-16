@@ -10,12 +10,22 @@ GET  /{instance}/stream      — the one way out (SSE)
 ## Quick Start
 
 ```bash
-pip install flask
+git clone https://github.com/clovenbradshaw-ctrl/Choreo.git
+cd Choreo
+pip install -r requirements.txt
 python3 choreo_runtime.py --port 8420
-# → https://choreo.intelechia.com/ui
+# → http://localhost:8420/ui
 ```
 
-Seed demo data: `POST https://choreo.intelechia.com/demo/seed`
+Or with Docker:
+
+```bash
+git clone https://github.com/clovenbradshaw-ctrl/Choreo.git
+cd Choreo
+docker compose up -d
+```
+
+Seed demo data: `POST http://localhost:8420/demo/seed`
 
 ## The Nine Operators
 
@@ -38,6 +48,7 @@ Every mutation is one of these nine. Every query is a DES. Schema is data. The l
 | [FRACTAL.md](FRACTAL.md) | Self-similar structure of the framework |
 | [EVENT_TYPES.md](EVENT_TYPES.md) | Nine operators replace 200+ event types |
 | [developer_guide.md](developer_guide.md) | API reference and integration patterns |
+| [DEPLOY.md](DEPLOY.md) | Production deployment, SSL, nginx, Docker, PM2, webhooks |
 
 ## Key Concepts
 
@@ -51,7 +62,13 @@ Every mutation is one of these nine. Every query is a DES. Schema is data. The l
 
 ## Production
 
+See [DEPLOY.md](DEPLOY.md) for the full deployment guide covering nginx, SSL, PM2, Docker, webhooks, and n8n integration.
+
 ```bash
-python3 choreo_runtime.py --nginx choreo.intelechia.com  # generates nginx config
-pm2 start choreo_runtime.py --interpreter python3 -- --port 8420
+# Quick start with PM2
+pm2 start ecosystem.config.js
+pm2 save && pm2 startup
+
+# Or with Docker
+docker compose up -d
 ```
