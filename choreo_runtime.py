@@ -1938,6 +1938,70 @@ def get_gaps(instance, tbl):
 
 
 # ---------------------------------------------------------------------------
+# Bulk Documentation Endpoint
+# ---------------------------------------------------------------------------
+_DOC_FILES = [
+    ("OPERATORS.md",       "The Nine Operators — Complete Reference"),
+    ("EOQL.md",            "EOQL — Query Language Reference"),
+    ("developer_guide.md", "Developer Guide — API Reference & Integration Patterns"),
+    ("EVENT_TYPES.md",     "Nine Operators Replace 200+ Event Types"),
+    ("DESIGN.md",          "Design Decisions"),
+    ("SYSTEM_PROMPT_GUIDE.md", "System Prompt Guide — LLM Tool Integration"),
+    ("THEORY.md",          "Theoretical Foundations — Graph Traversal & EO"),
+    ("FRACTAL.md",         "Fractal Structure of the Framework"),
+]
+
+@app.route("/docs", methods=["GET"])
+def bulk_docs():
+    """Return all Choreo documentation concatenated as a single text response.
+
+    Useful for giving a developer the complete reference in one copy-paste,
+    or for feeding into an LLM context window.
+
+    Query params:
+      ?format=json   — returns JSON with each doc as a separate entry
+      (default)      — returns plain text with separators
+    """
+    base = Path(__file__).resolve().parent
+    fmt = request.args.get("format", "text")
+
+    if fmt == "json":
+        docs = []
+        for filename, title in _DOC_FILES:
+            path = base / filename
+            if path.exists():
+                docs.append({
+                    "file": filename,
+                    "title": title,
+                    "content": path.read_text(encoding="utf-8"),
+                })
+        return jsonify({"count": len(docs), "docs": docs})
+
+    # Default: plain text with clear separators
+    sections = []
+    for filename, title in _DOC_FILES:
+        path = base / filename
+        if path.exists():
+            content = path.read_text(encoding="utf-8")
+            sections.append(
+                f"{'=' * 80}\n"
+                f"  {title}\n"
+                f"  Source: {filename}\n"
+                f"{'=' * 80}\n\n"
+                f"{content}"
+            )
+
+    header = (
+        "CHOREO — Complete Developer Documentation\n"
+        "==========================================\n"
+        f"Generated from {len(sections)} source files.\n"
+        "Copy this entire block to give a developer the full Choreo reference.\n\n"
+    )
+
+    return Response(header + "\n\n".join(sections), mimetype="text/plain; charset=utf-8")
+
+
+# ---------------------------------------------------------------------------
 # Health / Info
 # ---------------------------------------------------------------------------
 @app.route("/", methods=["GET"])
@@ -1962,6 +2026,7 @@ def index():
             "GET /{instance}/state/{table}/{id}": "Convenience entity lookup",
             "GET /{instance}/biography/{entity_id}": "Full entity operation history",
             "GET /{instance}/gaps/{table}": "Gap analysis by operator absence",
+            "GET /docs": "All documentation as single copyable text (?format=json for structured)",
         }
     })
 
