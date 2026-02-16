@@ -12,10 +12,10 @@ GET  /{instance}/stream      — the one way out (SSE)
 ```bash
 pip install flask
 python3 choreo_runtime.py --port 8420
-# → http://localhost:8420/ui
+# → https://choreo.intelechia.com/ui
 ```
 
-Seed demo data: `POST http://localhost:8420/demo/seed`
+Seed demo data: `POST https://choreo.intelechia.com/demo/seed`
 
 ## The Nine Operators
 
@@ -52,6 +52,6 @@ Every mutation is one of these nine. Every query is a DES. Schema is data. The l
 ## Production
 
 ```bash
-python3 choreo_runtime.py --nginx choreo.yourdomain.com  # generates nginx config
+python3 choreo_runtime.py --nginx choreo.intelechia.com  # generates nginx config
 pm2 start choreo_runtime.py --interpreter python3 -- --port 8420
 ```
