@@ -27,7 +27,9 @@ This constraint exists because of EO's principle that queries are operations. Wh
 
 ## Frame Is a Column, Not a Table
 
-The `frame` JSON column lives on every operation, alongside `target` and `context`. It's not a separate table, not a foreign key to a definitions registry, not a configuration file.
+The `frame` JSON column lives on every operation, alongside `target` and `operand`. It's not a separate table, not a foreign key to a definitions registry, not a configuration file.
+
+Note on naming: in the wire format, the three fields are `target` (dot-notation address), `operand` (payload, with dot-notation keys), and `frame`. Internally, the database stores this as the `target`, `context`, and `frame` columns — `operand` is the wire name for what the log calls `context`.
 
 This is because in EO, the frame is part of the operation, not external to it. "Alice is the Community Lead (according to the neighborhood council)" is a single fact with an embedded frame, not a fact plus a pointer to a frame table. The authority, the confidence, the epistemic status — these travel with the operation, in the log, forever.
 

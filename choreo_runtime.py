@@ -1447,9 +1447,7 @@ def seed_instance(slug):
         op = op_data.get("op")
         if op not in VALID_OPS:
             continue
-        target = op_data.get("target", {})
-        context = op_data.get("context", {})
-        frame = op_data.get("frame", {})
+        _, target, context, frame = _parse_new_format(op_data)
         ts = op_data.get("ts")
 
         s_op_id, _, _ = _insert_op(db, op, target, context, frame, ts=ts)
@@ -1471,6 +1469,78 @@ def rebuild_instance(slug):
     return jsonify({"rebuilt": True})
 
 
+# -- New-format operation parsing --
+
+def _expand_dot_target(target_str: str, operand: dict) -> tuple:
+    """
+    Translate a dot-notation target string + operand dict into internal (target, context) dicts.
+
+    Target address formats:
+      "tables.{table}.{entityId}"                 → entity-level op
+      "tables.{table}"                            → table-level op (CON, SYN, REC)
+      "tables.{table}.{entityId}.fields.{field}"  → field-level op (NUL field)
+
+    Operand namespaces:
+      "fields.*"  → target[field_name]            (entity field data)
+      "conn.*"    → target[key]                   (CON: source/target/stance/coupling)
+      "merge.*"   → target[key]                   (SYN: merge_into/merge_from)
+      "meta.*"    → context[key]                  (routing metadata: type/boundary/source)
+    """
+    parts = target_str.split(".")
+    context = {}
+    target = {}
+
+    if target_str == "query":
+        target["query"] = (operand or {}).get("fields.query", "")
+        context["type"] = (operand or {}).get("meta.type", "query")
+        return target, context
+
+    if len(parts) >= 2 and parts[0] == "tables":
+        context["table"] = parts[1]
+        if len(parts) == 3:
+            target["id"] = parts[2]
+        elif len(parts) == 5 and parts[3] == "fields":
+            target["entity_id"] = parts[2]
+            target["field"] = parts[4]
+
+    for k, v in (operand or {}).items():
+        if k.startswith("fields."):
+            target[k[len("fields."):]] = v
+        elif k.startswith("conn."):
+            target[k[len("conn."):]] = v
+        elif k.startswith("merge."):
+            target[k[len("merge."):]] = v
+        elif k.startswith("meta."):
+            context[k[len("meta."):]] = v
+        else:
+            target[k] = v
+
+    return target, context
+
+
+def _parse_new_format(body: dict) -> tuple:
+    """
+    Parse an operation body in either new or old wire format.
+
+    New format: target is a dot-notation string, payload is under "operand".
+    Old format: target is a JSON object, payload routing is under "context".
+
+    Returns (op, target_dict, context_dict, frame_dict).
+    """
+    op = body.get("op")
+    raw_target = body.get("target")
+    frame = body.get("frame", {})
+
+    if isinstance(raw_target, str):
+        operand = body.get("operand", {})
+        target, context = _expand_dot_target(raw_target, operand)
+    else:
+        target = raw_target or {}
+        context = body.get("context", {})
+
+    return op, target, context, frame
+
+
 # -- The ONE endpoint --
 
 @app.route("/<instance>/operations", methods=["POST"])
@@ -1488,12 +1558,10 @@ def post_operation(instance):
     if op not in VALID_OPS:
         return jsonify({"error": f"Invalid op: {op}. Must be one of {sorted(VALID_OPS)}"}), 400
 
-    target = body.get("target", {})
-    context = body.get("context", {})
-    frame = body.get("frame", {})
+    _, target, context, frame = _parse_new_format(body)
 
     # --- DES as query ---
-    if op == "DES" and "query" in target:
+    if op == "DES" and isinstance(target, dict) and "query" in target:
         query_str = target["query"]
         parsed = parse_eoql(query_str)
 
