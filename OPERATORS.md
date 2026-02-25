@@ -146,11 +146,15 @@ Only NUL represents true destruction. All other absences are inferred from which
 Every operation follows the same structure:
 
 ```
-operator(target, context, frame)
+operator(target [dot notation], operand [payload], frame [optional])
 ```
 
-- **target**: what is being operated on. Always JSON. Usually contains an `id` field.
-- **context**: where and how the operation occurs. Contains `table` (which projection table), and optionally `type`, `source`, and other metadata.
+- **target**: a dot-notation address string identifying *what* is being operated on and *where*. Format: `tables.{tableName}.{entityId}`. For field-level operations: `tables.{tableName}.{entityId}.fields.{fieldName}`. Table-level operations (CON, SYN, REC) omit the entity segment: `tables.{tableName}`.
+- **operand**: the payload of the operation. Keys use dot-notation namespaces:
+  - `fields.{name}` — entity field data (INS, ALT, DES, SUP, REC)
+  - `conn.{key}` — relationship properties for CON (`source`, `target`, `stance`, `coupling`)
+  - `merge.{key}` — merge properties for SYN (`merge_into`, `merge_from`)
+  - `meta.{key}` — routing metadata (`type`, `boundary`, `source`, etc.)
 - **frame**: the interpretive lens. Why this operation matters, under whose authority, with what confidence. Optional on most operations, but a DES without a frame is hiding an assumption.
 
 The frame is not decoration. It modifies how the operation affects projection. An INS with `frame.epistemic: "given"` (observed fact) carries different provenance than an INS with `frame.epistemic: "meant"` (human interpretation) or `frame.epistemic: "derived"` (computed value).

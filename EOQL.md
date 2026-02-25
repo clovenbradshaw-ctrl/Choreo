@@ -12,6 +12,8 @@ curl -X POST https://choreo.intelechia.com/my-instance/operations \
   }'
 ```
 
+> **Note:** DES queries use the legacy object form for `target` (with a `query` key) rather than the dot-notation address format used by mutation operations. This is intentional — queries are a read path that doesn't map cleanly to an entity address.
+
 ---
 
 ## state() — Current projected state

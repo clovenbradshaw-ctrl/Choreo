@@ -33,8 +33,8 @@ The shape is always:
 ```json
 {
   "op": "<OPERATOR>",
-  "target": { },
-  "context": { },
+  "target": "tables.{table}.{entityId}",
+  "operand": { "fields.key": "value" },
   "frame": { }
 }
 ```
@@ -42,9 +42,26 @@ The shape is always:
 | Field | Type | Required | Purpose |
 |-------|------|----------|---------|
 | `op` | string | Yes | One of exactly nine operators (see below) |
-| `target` | object | Yes | **What** is being operated on |
-| `context` | object | Yes | **Where/how** it happens (must include `table` for most ops) |
+| `target` | string | Yes | Dot-notation address — **what** and **where**: `tables.{table}.{entityId}` |
+| `operand` | object | Yes | The payload — dot-notation keys: `fields.*` for entity data, `conn.*` for CON edges, `merge.*` for SYN, `meta.*` for routing metadata |
 | `frame` | object | No | **Why** — interpretive metadata (authority, epistemic status, source) |
+
+**Operand namespaces:**
+
+| Prefix | Maps to | Used by |
+|--------|---------|---------|
+| `fields.{name}` | Entity field data | INS, ALT, DES, SUP, REC |
+| `conn.{key}` | CON relationship properties (`source`, `target`, `stance`, `coupling`) | CON |
+| `merge.{key}` | SYN merge properties (`merge_into`, `merge_from`) | SYN |
+| `meta.{key}` | Routing metadata (`type`, `boundary`, `source`, etc.) | All |
+
+**Target address formats:**
+
+| Format | Meaning |
+|--------|---------|
+| `tables.{table}.{entityId}` | Entity-level operation |
+| `tables.{table}` | Table-level operation (CON, SYN, REC) |
+| `tables.{table}.{entityId}.fields.{field}` | Field-level operation (NUL field) |
 
 That's it. There is no other write format. No PUT, no PATCH, no GraphQL. One endpoint, one shape.
 
@@ -138,24 +155,21 @@ Every example below is a `POST /{instance}/operations` with `Content-Type: appli
 ```json
 {
   "op": "INS",
-  "target": {
-    "id": "pl0",
-    "name": "Listening Room",
-    "type": "venue",
-    "status": "open",
-    "capacity": 200
-  },
-  "context": {
-    "table": "places",
-    "source": "manual-entry"
+  "target": "tables.places.pl0",
+  "operand": {
+    "fields.name": "Listening Room",
+    "fields.type": "venue",
+    "fields.status": "open",
+    "fields.capacity": 200,
+    "meta.source": "manual-entry"
   }
 }
 ```
 
 **Rules:**
-- `target.id` is **required**. You assign it. It must be unique within its `context.table`.
-- `context.table` is required. Tables are created implicitly — no setup needed.
-- All other fields in `target` become the entity's data.
+- The entity ID is the last segment of the `target` address (`pl0`). It must be unique within its table.
+- The table is the second segment (`places`). Tables are created implicitly — no setup needed.
+- All `fields.*` keys in `operand` become the entity's data.
 - If an entity with this ID already exists in this table, INS **merges** new fields into existing data (does NOT replace).
 
 **Response:**
@@ -170,18 +184,17 @@ Every example below is a `POST /{instance}/operations` with `Content-Type: appli
 ```json
 {
   "op": "ALT",
-  "target": {
-    "id": "pl0",
-    "status": "closed",
-    "capacity": 180
+  "target": "tables.places.pl0",
+  "operand": {
+    "fields.status": "closed",
+    "fields.capacity": 180
   },
-  "context": {"table": "places"},
   "frame": {"reason": "Renovation underway"}
 }
 ```
 
 **Rules:**
-- Only fields present in `target` are updated. All other fields are untouched.
+- Only `fields.*` keys in `operand` are updated. All other fields on the entity are untouched.
 - If the entity doesn't exist, ALT is a **silent no-op** (not an error).
 - `frame` is optional metadata stored in the log about *why* this change happened.
 
@@ -198,18 +211,16 @@ Every example below is a `POST /{instance}/operations` with `Content-Type: appli
 ```json
 {
   "op": "NUL",
-  "target": {"id": "pl0"},
-  "context": {"table": "places"}
+  "target": "tables.places.pl0"
 }
 ```
 Marks entity as dead. Kills all its CON edges.
 
-**Field-level destruction:**
+**Field-level destruction** (5-part address):
 ```json
 {
   "op": "NUL",
-  "target": {"entity_id": "pl0", "field": "capacity"},
-  "context": {"table": "places"}
+  "target": "tables.places.pl0.fields.capacity"
 }
 ```
 Marks a single field as explicitly destroyed. Stores `{"_nul": true, "op_id": N}` on that field in the projection. This is distinct from a field being absent (never observed) or null.
@@ -226,24 +237,24 @@ Marks a single field as explicitly destroyed. Stores `{"_nul": true, "op_id": N}
 ```json
 {
   "op": "CON",
-  "target": {
-    "source": "pl0",
-    "target": "pe0",
-    "stance": "essential",
-    "coupling": 0.8,
-    "type": "works_at"
-  },
-  "context": {"table": "places"}
+  "target": "tables.places",
+  "operand": {
+    "conn.source": "pl0",
+    "conn.target": "pe0",
+    "conn.stance": "essential",
+    "conn.coupling": 0.8,
+    "conn.type": "works_at"
+  }
 }
 ```
 
 **Rules:**
-- `source` and `target` are entity IDs. They can be in different tables.
-- `stance` is one of: `"accidental"`, `"essential"`, `"generative"`. If omitted, inferred from coupling (>=0.7 essential, >=0.55 generative, else accidental).
-- `coupling` is a float from 0.0 to 1.0. Defaults to 0.5.
-- Additional fields in `target` (like `type`) are stored as edge metadata.
+- `target` is table-scoped (no entity ID) — CON creates an edge, not an entity state.
+- `conn.source` and `conn.target` are entity IDs. They can be in different tables.
+- `conn.stance` is one of: `"accidental"`, `"essential"`, `"generative"`. If omitted, inferred from coupling (>=0.7 essential, >=0.55 generative, else accidental).
+- `conn.coupling` is a float from 0.0 to 1.0. Defaults to 0.5.
+- Additional `conn.*` keys (like `conn.type`) are stored as edge metadata.
 - Edges are directional (source -> target) but traversal queries follow both directions.
-- Alternate field names `from`/`to` accepted instead of `source`/`target`.
 - CON between nonexistent entities still creates the edge (leniency by design).
 
 **The three stances mean:**
@@ -266,20 +277,19 @@ Marks a single field as explicitly destroyed. Stores `{"_nul": true, "op_id": N}
 ```json
 {
   "op": "SYN",
-  "target": {
-    "merge_into": "pl0",
-    "merge_from": "pl7"
-  },
-  "context": {"table": "places"}
+  "target": "tables.places",
+  "operand": {
+    "merge.merge_into": "pl0",
+    "merge.merge_from": "pl7"
+  }
 }
 ```
 
 **Rules:**
-- Merges `merge_from` into `merge_into`. Data from `merge_into` wins on field conflicts.
+- Merges `merge.merge_from` into `merge.merge_into`. Data from the surviving entity wins on field conflicts.
 - `merge_from` is marked dead.
 - All CON edges pointing to `merge_from` are reassigned to `merge_into`.
 - A `_syn_from` array on the surviving entity tracks merge history.
-- Alternate field names: `primary`/`secondary`.
 
 **Response:**
 ```json
@@ -293,20 +303,20 @@ Marks a single field as explicitly destroyed. Stores `{"_nul": true, "op_id": N}
 ```json
 {
   "op": "SUP",
-  "target": {
-    "id": "pl0",
-    "field": "capacity",
-    "variants": [
+  "target": "tables.places.pl0",
+  "operand": {
+    "fields.field": "capacity",
+    "fields.variants": [
       {"source": "permit", "value": 200},
       {"source": "website", "value": 180},
       {"source": "fire_marshal", "value": 195}
     ]
-  },
-  "context": {"table": "places"}
+  }
 }
 ```
 
 **Rules:**
+- `fields.field` names the field to put in superposition. `fields.variants` is the list of simultaneous values.
 - The field's projected value becomes `{"_sup": [...variants], "op_id": N}`.
 - SUP is for genuine ambiguity (two sources disagree), not for versioning (the log already tracks every change).
 - Queries match against any variant's value.
@@ -326,12 +336,11 @@ DES has **two modes**. This is the most important operator to understand.
 ```json
 {
   "op": "DES",
-  "target": {
-    "id": "pe0",
-    "title": "Community Lead",
-    "appointed_by": "neighborhood_council"
+  "target": "tables.people.pe0",
+  "operand": {
+    "fields.title": "Community Lead",
+    "fields.appointed_by": "neighborhood_council"
   },
-  "context": {"table": "people"},
   "frame": {"authority": "city_council", "epistemic": "meant"}
 }
 ```
@@ -340,6 +349,9 @@ Stores the fields in a `_des` namespace on the entity — separate from its data
 **Warning:** A DES without a frame returns `"_warning": "unframed_designation"` in the response. The system flags frame-hiding.
 
 **Mode 2: Query (designating attention) — THIS IS HOW YOU READ DATA**
+
+> DES queries use the legacy object form for `target` (not dot-notation). This is intentional — a query designates attention, not an entity address.
+
 ```json
 {
   "op": "DES",
@@ -367,12 +379,14 @@ The response will include `"audited": true` and `"audit_op_id"`.
 ```json
 {
   "op": "SEG",
-  "target": {"id": "pl0"},
-  "context": {"table": "places", "boundary": "downtown-district"}
+  "target": "tables.places.pl0",
+  "operand": {
+    "meta.boundary": "downtown-district"
+  }
 }
 ```
 
-Records boundary metadata on the entity (stored in a `_seg` array). The `boundary` can be in either `target` or `context`. Used for filtering at query time.
+Records boundary metadata on the entity (stored in a `_seg` array). Used for filtering at query time.
 
 **Response:**
 ```json
@@ -385,23 +399,21 @@ Records boundary metadata on the entity (stored in a `_seg` array). The `boundar
 
 REC is the system operating on its own output. It has three context types:
 
-#### Mode 1: Snapshot Ingest (`context.type: "snapshot_ingest"`)
+#### Mode 1: Snapshot Ingest (`meta.type: "snapshot_ingest"`)
 
 Feed Choreo raw data and let it figure out what changed:
 
 ```json
 {
   "op": "REC",
-  "target": {
-    "rows": [
+  "target": "tables.places",
+  "operand": {
+    "meta.type": "snapshot_ingest",
+    "fields.rows": [
       {"name": "Listening Room", "hours": "6p-12a", "status": "open"},
       {"name": "Five Points Pizza", "hours": "11a-10p", "status": "open"},
       {"name": "Brand New Place", "hours": "9a-5p", "status": "open"}
     ]
-  },
-  "context": {
-    "type": "snapshot_ingest",
-    "table": "places"
   },
   "frame": {
     "match_on": "name",
@@ -448,26 +460,26 @@ Feed Choreo raw data and let it figure out what changed:
 
 Every generated operation carries `"generated_by": <rec_op_id>` in its context for traceability.
 
-#### Mode 2: Feedback Rule (`context.type: "feedback_rule"`)
+#### Mode 2: Feedback Rule (`meta.type: "feedback_rule"`)
 
 Register a rule that watches for operations and generates new operations in response:
 
 ```json
 {
   "op": "REC",
-  "target": {
-    "id": "rule-flag-absent",
-    "trigger": {
+  "target": "tables._rules.rule-flag-absent",
+  "operand": {
+    "meta.type": "feedback_rule",
+    "fields.trigger": {
       "op": "DES",
       "match": {"target.flag": "absent_from_snapshot"}
     },
-    "action": {
+    "fields.action": {
       "op": "ALT",
       "target_template": {"id": "{trigger.target.id}", "status": "needs_investigation"},
       "context": {"table": "{trigger.context.table}"}
     }
   },
-  "context": {"type": "feedback_rule"},
   "frame": {"authority": "michael"}
 }
 ```
@@ -478,19 +490,20 @@ Register a rule that watches for operations and generates new operations in resp
 - Rules fire once per incoming operation. **No cascading** — a rule-generated operation will NOT trigger other rules in the same pass.
 - Generated operations carry `generated_by_rule` in their context.
 
-#### Mode 3: Emergence Scan (`context.type: "emergence_scan"`)
+#### Mode 3: Emergence Scan (`meta.type: "emergence_scan"`)
 
 Scan the CON graph for unnamed clusters:
 
 ```json
 {
   "op": "REC",
-  "target": {
-    "algorithm": "connected_components",
-    "min_cluster_size": 3,
-    "min_internal_coupling": 0.5
+  "target": "tables._emergent",
+  "operand": {
+    "meta.type": "emergence_scan",
+    "fields.algorithm": "connected_components",
+    "fields.min_cluster_size": 3,
+    "fields.min_internal_coupling": 0.5
   },
-  "context": {"type": "emergence_scan"},
   "frame": {"authority": "system", "confidence": "algorithmic"}
 }
 ```
@@ -866,8 +879,11 @@ When writing operations, include `epistemic`, `source`, and/or `authority` in th
 ```json
 {
   "op": "INS",
-  "target": {"id": "pl0", "name": "Listening Room", "capacity": 200},
-  "context": {"table": "places"},
+  "target": "tables.places.pl0",
+  "operand": {
+    "fields.name": "Listening Room",
+    "fields.capacity": 200
+  },
   "frame": {
     "epistemic": "given",
     "source": "manual-entry",
@@ -907,6 +923,8 @@ Control how SUP and SEG data is presented at query time:
 }
 ```
 
+> DES queries retain the legacy object-form `target`/`context` — dot-notation is for mutation operations only.
+
 | Setting | Values | Effect |
 |---------|--------|--------|
 | `conflict` | `"preserve"` (default) | SUP fields returned as-is with all variants |
@@ -932,9 +950,9 @@ Content-Type: application/json
 
 {
   "operations": [
-    {"op": "INS", "target": {"id": "p1", "name": "Alice"}, "context": {"table": "people"}},
-    {"op": "INS", "target": {"id": "p2", "name": "Bob"}, "context": {"table": "people"}},
-    {"op": "CON", "target": {"source": "p1", "target": "p2", "coupling": 0.6}, "context": {"table": "people"}}
+    {"op": "INS", "target": "tables.people.p1", "operand": {"fields.name": "Alice"}},
+    {"op": "INS", "target": "tables.people.p2", "operand": {"fields.name": "Bob"}},
+    {"op": "CON", "target": "tables.people", "operand": {"conn.source": "p1", "conn.target": "p2", "conn.coupling": 0.6}}
   ]
 }
 ```
@@ -1062,43 +1080,43 @@ Copy-paste templates for every operator:
 
 ```jsonc
 // INS — Create entity
-{"op": "INS", "target": {"id": "ID", "field": "value"}, "context": {"table": "TABLE"}}
+{"op": "INS", "target": "tables.TABLE.ID", "operand": {"fields.field": "value"}}
 
 // ALT — Update fields
-{"op": "ALT", "target": {"id": "ID", "field": "new_value"}, "context": {"table": "TABLE"}}
+{"op": "ALT", "target": "tables.TABLE.ID", "operand": {"fields.field": "new_value"}}
 
 // NUL — Destroy entity
-{"op": "NUL", "target": {"id": "ID"}, "context": {"table": "TABLE"}}
+{"op": "NUL", "target": "tables.TABLE.ID"}
 
 // NUL — Destroy field
-{"op": "NUL", "target": {"entity_id": "ID", "field": "FIELD"}, "context": {"table": "TABLE"}}
+{"op": "NUL", "target": "tables.TABLE.ID.fields.FIELD"}
 
 // CON — Connect entities
-{"op": "CON", "target": {"source": "ID_A", "target": "ID_B", "stance": "essential", "coupling": 0.8}, "context": {"table": "TABLE"}}
+{"op": "CON", "target": "tables.TABLE", "operand": {"conn.source": "ID_A", "conn.target": "ID_B", "conn.stance": "essential", "conn.coupling": 0.8}}
 
 // SYN — Merge entities
-{"op": "SYN", "target": {"merge_into": "KEEP_ID", "merge_from": "KILL_ID"}, "context": {"table": "TABLE"}}
+{"op": "SYN", "target": "tables.TABLE", "operand": {"merge.merge_into": "KEEP_ID", "merge.merge_from": "KILL_ID"}}
 
 // SUP — Multi-value field
-{"op": "SUP", "target": {"id": "ID", "field": "FIELD", "variants": [{"source": "SRC", "value": "VAL"}]}, "context": {"table": "TABLE"}}
+{"op": "SUP", "target": "tables.TABLE.ID", "operand": {"fields.field": "FIELD", "fields.variants": [{"source": "SRC", "value": "VAL"}]}}
 
 // DES — Designate entity
-{"op": "DES", "target": {"id": "ID", "label": "value"}, "context": {"table": "TABLE"}, "frame": {"authority": "WHO"}}
+{"op": "DES", "target": "tables.TABLE.ID", "operand": {"fields.label": "value"}, "frame": {"authority": "WHO"}}
 
-// DES — Query
+// DES — Query (legacy object form — dot-notation not used for queries)
 {"op": "DES", "target": {"query": "state(context.table=\"TABLE\")"}, "context": {"type": "query"}}
 
 // SEG — Boundary tag
-{"op": "SEG", "target": {"id": "ID"}, "context": {"table": "TABLE", "boundary": "BOUNDARY"}}
+{"op": "SEG", "target": "tables.TABLE.ID", "operand": {"meta.boundary": "BOUNDARY"}}
 
 // REC — Snapshot ingest
-{"op": "REC", "target": {"rows": [{"id": "1", "field": "val"}]}, "context": {"type": "snapshot_ingest", "table": "TABLE"}, "frame": {"match_on": "id", "absence_means": "unchanged"}}
+{"op": "REC", "target": "tables.TABLE", "operand": {"meta.type": "snapshot_ingest", "fields.rows": [{"id": "1", "field": "val"}]}, "frame": {"match_on": "id", "absence_means": "unchanged"}}
 
 // REC — Feedback rule
-{"op": "REC", "target": {"id": "rule-name", "trigger": {"op": "ALT", "match": {"target.field": "value"}}, "action": {"op": "ALT", "target_template": {"id": "{trigger.target.id}", "field": "new_value"}, "context": {"table": "{trigger.context.table}"}}}, "context": {"type": "feedback_rule"}}
+{"op": "REC", "target": "tables._rules.rule-name", "operand": {"meta.type": "feedback_rule", "fields.trigger": {"op": "ALT", "match": {"target.field": "value"}}, "fields.action": {"op": "ALT", "target_template": {"id": "{trigger.target.id}", "field": "new_value"}, "context": {"table": "{trigger.context.table}"}}}}
 
 // REC — Emergence scan
-{"op": "REC", "target": {"algorithm": "connected_components", "min_cluster_size": 3, "min_internal_coupling": 0.5}, "context": {"type": "emergence_scan"}}
+{"op": "REC", "target": "tables._emergent", "operand": {"meta.type": "emergence_scan", "fields.algorithm": "connected_components", "fields.min_cluster_size": 3, "fields.min_internal_coupling": 0.5}}
 ```
 
 ---
@@ -1120,8 +1138,8 @@ requests.post(f"{BASE}/instances", json={"slug": INST})
 for place in [("pl0", "Listening Room"), ("pl1", "Five Points Pizza")]:
     requests.post(f"{BASE}/{INST}/operations", json={
         "op": "INS",
-        "target": {"id": place[0], "name": place[1], "status": "open"},
-        "context": {"table": "places"}
+        "target": f"tables.places.{place[0]}",
+        "operand": {"fields.name": place[1], "fields.status": "open"}
     })
 
 # Query them back
@@ -1145,8 +1163,8 @@ scraped = [
 
 r = requests.post(f"{BASE}/{INST}/operations", json={
     "op": "REC",
-    "target": {"rows": scraped},
-    "context": {"type": "snapshot_ingest", "table": "places"},
+    "target": "tables.places",
+    "operand": {"meta.type": "snapshot_ingest", "fields.rows": scraped},
     "frame": {"match_on": "name", "absence_means": "unchanged"}
 })
 result = r.json()
